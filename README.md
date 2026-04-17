@@ -54,6 +54,13 @@ npm run start
 - Session-aware observed highs and recent evaluations reset automatically at the start of a new New York market day.
 - Unsupported signal families such as News Catalyst and Relative Volume Surge are intentionally omitted until real source data is available.
 
+## AI layer
+
+- AI orchestration service lives in [lib/ai/signal-analysis-layer.ts](/c:/Users/arung/Pulse_Grid/lib/ai/signal-analysis-layer.ts).
+- AI-backed signal analysis route lives in [app/api/analysis/signal/route.ts](/c:/Users/arung/Pulse_Grid/app/api/analysis/signal/route.ts).
+- If `OPENAI_API_KEY` is missing, analysis automatically falls back to deterministic rules output.
+- Optional model override: `OPENAI_MODEL` (default `gpt-4o-mini`).
+
 ## V1 features
 
 - Premium dark dashboard with responsive layout

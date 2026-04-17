@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { generateSignalAnalysisWithAi } from "@/lib/ai/signal-analysis-layer";
 import {
   createSignalAnalysisFingerprint,
   generateDeterministicSignalAnalysis,
@@ -76,136 +77,6 @@ function writeCachedAnalysis(key: string, analysis: SignalAnalysis, ttlMs = ANAL
   });
 }
 
-function getOpenAiApiKey() {
-  return process.env.OPENAI_API_KEY?.trim() ?? "";
-}
-
-function getOpenAiModel() {
-  return process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
-}
-
-function extractJsonObject(text: string) {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) {
-      return null;
-    }
-
-    try {
-      return JSON.parse(trimmed.slice(start, end + 1)) as unknown;
-    } catch {
-      return null;
-    }
-  }
-}
-
-function isLikelyCompleteAnalysisCandidate(value: Partial<SignalAnalysis>) {
-  return (
-    typeof value.summary === "string" &&
-    value.summary.trim().length > 0 &&
-    typeof value.bullCase === "string" &&
-    value.bullCase.trim().length > 0 &&
-    typeof value.risk === "string" &&
-    value.risk.trim().length > 0
-  );
-}
-
-async function generateLlmGroundedAnalysis(features: SignalAnalysisFeatures, fallback: SignalAnalysis): Promise<SignalAnalysis | null> {
-  const apiKey = getOpenAiApiKey();
-  if (!apiKey) {
-    return null;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3500);
-
-  try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: getOpenAiModel(),
-        max_output_tokens: 240,
-        input: [
-          {
-            role: "system",
-            content: [
-              {
-                type: "input_text",
-                text:
-                  "You are a grounded scanner analyst. Use only supplied fields. Never mention any external catalyst/news/filing/FDA/halts/borrow/CTB. Never include price targets or directional prediction. Never provide buy/sell/entry/stop advice. If degraded is true, be cautious and explicitly acknowledge reduced confidence.",
-              },
-            ],
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: `Analyze these deterministic scanner features and return only strict JSON with keys summary, bullCase, risk, stage, confidence, tone. Allowed enums: stage=[Early, In play, Extended], confidence=[High conviction, Strong, Developing], tone=[Breaking out, Holding, Building, Fading, Reappearing]. Keep summary <= 2 short sentences, bullCase <= 1 short sentence, risk <= 1 short sentence. Features: ${JSON.stringify(features)}`,
-              },
-            ],
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const payload = (await response.json()) as {
-      output_text?: string;
-    };
-
-    if (!payload.output_text) {
-      return null;
-    }
-
-    const parsedJson = extractJsonObject(payload.output_text);
-    if (!parsedJson || typeof parsedJson !== "object") {
-      return null;
-    }
-
-    const parsed = parsedJson as Partial<SignalAnalysis>;
-    if (!isLikelyCompleteAnalysisCandidate(parsed)) {
-      return null;
-    }
-
-    const sanitized = sanitizeSignalAnalysis(
-      {
-        ...parsed,
-        source: "llm",
-        generatedAt: new Date().toISOString(),
-      },
-      fallback,
-      { features },
-    );
-
-    if (!isLikelyCompleteAnalysisCandidate(sanitized)) {
-      return null;
-    }
-
-    return sanitized;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 export async function POST(request: NextRequest) {
   const payload = (await request.json()) as {
     features?: unknown;
@@ -259,7 +130,7 @@ export async function POST(request: NextRequest) {
 
   const fallback = generateDeterministicSignalAnalysis(features);
   const analysisPromise = (async () => {
-    const llmAnalysis = await generateLlmGroundedAnalysis(features, fallback);
+    const llmAnalysis = await generateSignalAnalysisWithAi(features, fallback);
     const analysis = llmAnalysis ?? fallback;
     const sanitized = sanitizeSignalAnalysis(analysis, fallback, { features });
     writeCachedAnalysis(cacheKey, sanitized);

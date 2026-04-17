@@ -569,6 +569,9 @@ export default function HomePage() {
                         <span className="rounded-full border border-white/10 px-2.5 py-1 text-[10px] text-slate-300">{topSetupAnalysis.stage}</span>
                         <span className="rounded-full border border-white/10 px-2.5 py-1 text-[10px] text-slate-300">{topSetupAnalysis.confidence}</span>
                         <span className="rounded-full border border-white/10 px-2.5 py-1 text-[10px] text-slate-300">{topSetupAnalysis.tone}</span>
+                        <span className="rounded-full border border-white/10 px-2.5 py-1 text-[10px] text-slate-300">
+                          {topSetupAnalysis.source === "llm" ? "AI model" : "Rules fallback"}
+                        </span>
                       </div>
                     ) : null}
                   </div>

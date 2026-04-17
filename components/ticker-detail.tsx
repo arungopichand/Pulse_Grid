@@ -84,7 +84,9 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
               <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Risk</p>
               <p className="text-sm leading-6 text-slate-200">{analysis.risk}</p>
             </div>
-            <p className="mt-4 text-xs text-slate-400">Grounded scanner interpretation only. Not financial advice.</p>
+            <p className="mt-4 text-xs text-slate-400">
+              Source: {analysis.source === "llm" ? "AI model" : "rules fallback"} | Grounded scanner interpretation only. Not financial advice.
+            </p>
           </div>
         ) : null}
 
