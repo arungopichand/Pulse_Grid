@@ -28,17 +28,19 @@ export function relativeTime(timestamp: string) {
   const diffMs = Date.now() - new Date(timestamp).getTime();
   const diffMins = Math.max(0, Math.round(diffMs / 60000));
 
-  if (diffMins < 1) return "just now";
-  if (diffMins === 1) return "1 min ago";
+  if (diffMins < 1) return "Just now";
+  if (diffMins <= 2) return "Moments ago";
   return `${diffMins} mins ago`;
 }
 
 export function signalTone(signalType: SignalType) {
   switch (signalType) {
-    case "Breakout":
+    case "SPIKE":
       return "text-accent-cyan border-accent-cyan/25 bg-accent-cyan/10";
-    case "Momentum Spike":
+    case "BULLISH":
       return "text-accent-blue border-accent-blue/25 bg-accent-blue/10";
+    case "BEARISH":
+      return "text-rose-200 border-rose-300/25 bg-rose-300/10";
   }
 }
 
@@ -66,4 +68,20 @@ export function formatQuoteFreshness(freshness: QuoteFreshness | "missing") {
     default:
       return "No Quote";
   }
+}
+
+export function getSignalStageLabel(params: {
+  timestamp: string;
+  quoteFreshness: QuoteFreshness | "missing";
+  nowMs?: number;
+}) {
+  const ageSeconds = Math.max(0, Math.round(((params.nowMs ?? Date.now()) - new Date(params.timestamp).getTime()) / 1000));
+
+  if (params.quoteFreshness === "cached") {
+    return ageSeconds <= 900 ? "In play" : "Extended";
+  }
+
+  if (ageSeconds <= 240) return "Early";
+  if (ageSeconds <= 1200) return "In play";
+  return "Extended";
 }

@@ -54,12 +54,21 @@ npm run start
 - Session-aware observed highs and recent evaluations reset automatically at the start of a new New York market day.
 - Unsupported signal families such as News Catalyst and Relative Volume Surge are intentionally omitted until real source data is available.
 
+## Structured News Factor
+
+- Structured news ingestion lives in [lib/news-data.ts](/c:/Users/arung/Pulse_Grid/lib/news-data.ts).
+- Current source is Finnhub news sentiment (+ optional latest company headline when available).
+- Deterministic engine awards `newsScore` only when structured bullish/bearish news is present.
+- `BULLISH` and `BEARISH` signal types fire only from structured directional news, otherwise `SPIKE` remains the main type.
+- If structured news is unavailable for a cycle, the engine stays honest and keeps newsScore neutral.
+
 ## AI layer
 
 - AI orchestration service lives in [lib/ai/signal-analysis-layer.ts](/c:/Users/arung/Pulse_Grid/lib/ai/signal-analysis-layer.ts).
 - AI-backed signal analysis route lives in [app/api/analysis/signal/route.ts](/c:/Users/arung/Pulse_Grid/app/api/analysis/signal/route.ts).
 - If `OPENAI_API_KEY` is missing, analysis automatically falls back to deterministic rules output.
 - Optional model override: `OPENAI_MODEL` (default `gpt-4o-mini`).
+- AI is grounded on deterministic signal fields and cannot override ranking/scoring/freshness.
 
 ## V1 features
 

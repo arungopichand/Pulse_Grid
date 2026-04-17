@@ -20,6 +20,7 @@ export type SignalAnalysis = {
 export type SignalAnalysisFeatures = {
   ticker: string;
   signalType: Signal["signalType"];
+  confidenceLevel: Signal["confidence"];
   sessionStatus: SessionPhase;
   degraded: boolean;
   quoteFreshness: Signal["quoteFreshness"] | "stale" | "missing";
@@ -29,6 +30,21 @@ export type SignalAnalysisFeatures = {
   changePercent: number;
   confidenceScore: number;
   scannerScore: number;
+  momentumScore: number;
+  volumeScore: number;
+  newsScore: number;
+  trendScore: number;
+  factorCount: number;
+  topOpportunity: boolean;
+  factors: Signal["factors"];
+  newsSentiment: Signal["newsSentiment"];
+  newsAvailable: boolean;
+  hasNews: boolean;
+  bullishNews: boolean;
+  bearishNews: boolean;
+  newsHeadline: string | null;
+  newsSource: string | null;
+  newsTimestamp: string | null;
   relativeVolume: number | null;
   streakCount: number;
   reasonBadges: string[];
@@ -41,11 +57,12 @@ const CONFIDENCE_VALUES: SignalAnalysisConfidence[] = ["High conviction", "Stron
 const TONE_VALUES: SignalAnalysisTone[] = ["Breaking out", "Holding", "Building", "Fading", "Reappearing"];
 
 const BANNED_PATTERN =
-  /\b(news|catalyst|filing|fda|halt|ctb|borrow|short\s+interest|sec|earnings|merger|acquisition|buy|sell|entry|stop(?:-|\s)?loss|take(?:-|\s)?profit|price\s+target|target\s+price|upside\s+target|downside\s+target)\b/i;
+  /\b(catalyst|filing|fda|halt|ctb|borrow|short\s+interest|sec|earnings|merger|acquisition|buy|sell|entry|stop(?:-|\s)?loss|take(?:-|\s)?profit|price\s+target|target\s+price|upside\s+target|downside\s+target)\b/i;
 const FORWARD_LOOKING_PATTERN =
   /\b(will|going to|expected to|should|likely to|headed to|toward)\b/i;
 const OVERCONFIDENT_PATTERN =
   /\b(guaranteed|certain|no\s+risk|cannot\s+fail|sure\s+thing|definitely)\b/i;
+const NEWS_MENTION_PATTERN = /\b(news|headline|catalyst)\b/i;
 
 function clampText(text: string, maxLength: number) {
   if (text.length <= maxLength) {
@@ -69,6 +86,10 @@ function hasOverconfidentLanguage(value: string) {
 
 function hasForwardLookingLanguage(value: string) {
   return FORWARD_LOOKING_PATTERN.test(value);
+}
+
+function mentionsNewsContext(value: string) {
+  return NEWS_MENTION_PATTERN.test(value);
 }
 
 function normalizeStage(value: unknown): SignalAnalysisStage | null {
@@ -140,6 +161,7 @@ export function createSignalAnalysisFingerprint(features: SignalAnalysisFeatures
   return [
     features.ticker,
     features.signalType,
+    features.confidenceLevel,
     features.sessionStatus,
     features.degraded ? "degraded" : "healthy",
     features.quoteFreshness,
@@ -147,6 +169,10 @@ export function createSignalAnalysisFingerprint(features: SignalAnalysisFeatures
     getRankBucket(features.rank),
     features.rankMovement,
     getConfidenceScoreBucket(features.confidenceScore, features.scannerScore),
+    String(features.factorCount),
+    features.topOpportunity ? "top-opportunity" : "ranked",
+    features.newsScore > 0 ? "news" : "no-news",
+    features.newsSentiment,
     getMomentumBucket(features.changePercent),
     getVolumeBucket(features.relativeVolume),
     features.streakCount >= 2 ? "repeat" : "single",
@@ -154,11 +180,11 @@ export function createSignalAnalysisFingerprint(features: SignalAnalysisFeatures
 }
 
 function getConfidenceBucket(features: SignalAnalysisFeatures): SignalAnalysisConfidence {
-  if (getConfidenceScoreBucket(features.confidenceScore, features.scannerScore) === "high") {
+  if (features.confidenceLevel === "HIGH") {
     return "High conviction";
   }
 
-  if (getConfidenceScoreBucket(features.confidenceScore, features.scannerScore) === "strong") {
+  if (features.confidenceLevel === "MEDIUM") {
     return "Strong";
   }
 
@@ -214,9 +240,15 @@ function buildSummary(features: SignalAnalysisFeatures, stage: SignalAnalysisSta
       ? `RVOL is ${features.relativeVolume.toFixed(1)}x`
       : "volume confirmation is incomplete";
   const repeatClause = features.streakCount >= 2 ? ` with ${features.streakCount}x repeat strength` : "";
+  const newsClause =
+    features.newsScore > 0
+      ? features.newsSentiment === "bullish"
+        ? " Structured bullish news context is active."
+        : " Structured bearish news context is active."
+      : "";
 
   return clampText(
-    `${features.ticker} is ${tone.toLowerCase()} at rank #${features.rank} in ${stage.toLowerCase()} stage. Move is ${features.changePercent >= 0 ? "+" : ""}${features.changePercent.toFixed(2)}%, ${volumeClause}${repeatClause}, with ${confidence.toLowerCase()} structure.`,
+    `${features.ticker} is ${tone.toLowerCase()} at rank #${features.rank} in ${stage.toLowerCase()} stage. Move is ${features.changePercent >= 0 ? "+" : ""}${features.changePercent.toFixed(2)}%, ${volumeClause}${repeatClause}, with ${confidence.toLowerCase()} structure.${newsClause}`,
     220,
   );
 }
@@ -228,6 +260,10 @@ function buildBullCase(features: SignalAnalysisFeatures, tone: SignalAnalysisTon
 
   if ((features.relativeVolume ?? 0) >= 2.5 && features.changePercent >= 5) {
     return `Bull case is continued participation while ${features.ticker} keeps strong price expansion with above-normal volume.`;
+  }
+
+  if (features.newsScore > 0) {
+    return `Bull case is cleaner follow-through if structured ${features.newsSentiment} news context remains supportive.`;
   }
 
   if (tone === "Reappearing" || features.streakCount >= 2) {
@@ -254,6 +290,10 @@ function buildRisk(features: SignalAnalysisFeatures) {
     return "Risk is rank fade; if relative strength slips further, this setup can cool quickly.";
   }
 
+  if (features.newsAvailable && !features.hasNews) {
+    return "Risk is that no structured news edge is present, so this read depends mainly on tape behavior.";
+  }
+
   return "Risk is momentum fade if the current move stops expanding and rank starts to slip.";
 }
 
@@ -271,6 +311,7 @@ export function buildSignalAnalysisFeatures(params: {
   return {
     ticker: signal.ticker,
     signalType: signal.signalType,
+    confidenceLevel: signal.confidence,
     sessionStatus,
     degraded,
     quoteFreshness: signal.quoteFreshness,
@@ -278,8 +319,23 @@ export function buildSignalAnalysisFeatures(params: {
     rankMovement,
     price: signal.price,
     changePercent: signal.changePercent,
-    confidenceScore: signal.confidence,
-    scannerScore: signal.score,
+    confidenceScore: signal.confidenceScore,
+    scannerScore: signal.finalScore,
+    momentumScore: signal.scoreBreakdown.momentumScore,
+    volumeScore: signal.scoreBreakdown.volumeScore,
+    newsScore: signal.scoreBreakdown.newsScore,
+    trendScore: signal.scoreBreakdown.trendScore,
+    factorCount: signal.factorCount,
+    topOpportunity: signal.topOpportunity,
+    factors: signal.factors,
+    newsSentiment: signal.newsSentiment,
+    newsAvailable: signal.news.availability === "available",
+    hasNews: signal.news.hasNews,
+    bullishNews: signal.news.bullishNews,
+    bearishNews: signal.news.bearishNews,
+    newsHeadline: signal.news.headline,
+    newsSource: signal.news.source,
+    newsTimestamp: signal.news.publishedAt,
     relativeVolume: signal.relativeVolume,
     streakCount: signal.streakCount,
     reasonBadges: signal.reasonBadges.slice(0, 6),
@@ -324,6 +380,10 @@ function pickSafeText(value: unknown, fallback: string, maxLength: number, featu
   }
 
   if (features?.degraded && hasOverconfidentLanguage(normalized)) {
+    return fallback;
+  }
+
+  if ((features?.newsScore ?? 0) <= 0 && mentionsNewsContext(normalized)) {
     return fallback;
   }
 

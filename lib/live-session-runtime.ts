@@ -3,6 +3,7 @@ import { getMarketDataThresholds, marketDataProvider, type LiveSessionSnapshot, 
 import { getMarketClock } from "./market-session";
 import { computeVolumeMovers, type VolumeMover } from "./volume-movers";
 import { fetchVolumeSnapshots, type VolumeSnapshot } from "./volume-data";
+import { fetchStructuredNewsSnapshots } from "./news-data";
 import { loadPersistedSessionState, savePersistedSessionState, type PersistedSessionState, type PersistenceStatus, type PersistedSymbolHealth, type SymbolHealthOutcome } from "./session-state-store";
 import { backupWatchlistUniverse, type WatchlistTicker, watchlistUniverse } from "./watchlist";
 
@@ -263,7 +264,7 @@ function appendRecentEvaluations(state: PersistedSessionState, signals: Signal[]
         signalType: signal.signalType,
         timestamp: signal.timestamp,
         reason: signal.reason,
-        confidence: signal.confidence,
+        confidence: signal.confidenceScore,
       },
       ...existing,
     ].slice(0, 20);
@@ -395,7 +396,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   const fastLaneTickers = deriveFastLaneTickers();
   const quoteThresholds = getMarketDataThresholds();
 
-  const [quotesResult, volumeResult] = await Promise.all([
+  const [quotesResult, volumeResult, newsResult] = await Promise.all([
     fetchFinnhubQuotes(activeTickers, {
       prioritizedTickers: fastLaneTickers,
       fastLaneTickers,
@@ -404,6 +405,9 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     fetchVolumeSnapshots(activeTickers, {
       prioritizedTickers: fastLaneTickers,
       fastLaneTickers,
+    }),
+    fetchStructuredNewsSnapshots(activeTickers, {
+      prioritizedTickers: fastLaneTickers,
     }),
   ]);
 
@@ -431,6 +435,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     watchlist: activeUniverse,
     quotes: quotesResult.quotes,
     volumeSnapshots: volumeResult.snapshots,
+    newsSnapshots: newsResult.snapshots,
     recentEvaluations: loaded.state.recentEvaluations,
     observedAt: generatedAt,
   });

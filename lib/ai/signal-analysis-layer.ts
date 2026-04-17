@@ -105,7 +105,7 @@ export async function generateSignalAnalysisWithAi(
               {
                 type: "input_text",
                 text:
-                  "You are a grounded scanner analyst. Use only provided features. Never mention news/catalysts/filings/FDA/halts/borrow/CTB. Never provide buy/sell/entry/stop/target advice. Avoid deterministic predictions. If degraded is true, acknowledge lower confidence.",
+                  "You are a grounded scanner analyst. Use only provided deterministic fields. Mention news/catalyst context only when newsScore > 0 and hasNews is true. If newsScore is 0, do not mention news. Never invent headlines or catalysts. Never provide buy/sell/entry/stop/target advice. Do not override deterministic score, confidence, signalType, freshness, or ranking. If degraded is true, acknowledge lower confidence.",
               },
             ],
           },
@@ -114,7 +114,7 @@ export async function generateSignalAnalysisWithAi(
             content: [
               {
                 type: "input_text",
-                text: `Return strict JSON with keys summary, bullCase, risk, stage, confidence, tone. Allowed enums: stage=[Early, In play, Extended], confidence=[High conviction, Strong, Developing], tone=[Breaking out, Holding, Building, Fading, Reappearing]. Keep summary <= 2 short sentences; bullCase <= 1 sentence; risk <= 1 sentence. Features: ${JSON.stringify(features)}`,
+                text: `Return strict JSON with keys summary, bullCase, risk, stage, confidence, tone. Allowed enums: stage=[Early, In play, Extended], confidence=[High conviction, Strong, Developing], tone=[Breaking out, Holding, Building, Fading, Reappearing]. Keep summary <= 2 short sentences; bullCase <= 1 sentence; risk <= 1 sentence. Use confidenceLevel/factorCount/final scores and deterministic news fields as source-of-truth context. Features: ${JSON.stringify(features)}`,
               },
             ],
           },

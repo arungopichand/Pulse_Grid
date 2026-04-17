@@ -51,21 +51,44 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
 
         <div className="mt-6 grid gap-3 sm:grid-cols-2">
           <DetailMetric label="Price" value={formatCurrency(signal.price)} />
-          <DetailMetric label="Score" value={String(signal.score)} />
-          <DetailMetric label="Confidence" value={`${signal.confidence}`} />
+          <DetailMetric label="Score" value={String(signal.finalScore)} />
+          <DetailMetric label="Confidence" value={`${signal.confidence} (${signal.confidenceScore})`} />
           <DetailMetric label="Move" value={`${signal.changePercent >= 0 ? "+" : ""}${signal.changePercent.toFixed(2)}%`} />
           <DetailMetric label="RVOL" value={signal.relativeVolume !== null ? `${signal.relativeVolume.toFixed(2)}x` : "n/a"} />
-          <DetailMetric label="Sector" value={signal.sector} />
-          <DetailMetric label="Float" value={signal.floatShares ? `${Math.round(signal.floatShares / 1_000_000)}M` : "n/a"} />
           <DetailMetric label="Alert Time" value={formatTime(signal.timestamp)} />
           <DetailMetric label="Quote State" value={formatQuoteFreshness(signal.quoteFreshness)} toneClass={quoteFreshnessTone(signal.quoteFreshness)} />
-          <DetailMetric label="Provider" value={signal.quoteProvider} />
         </div>
 
         <div className="mt-6 rounded-3xl border border-white/8 bg-black/20 p-4">
           <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Why It Is Here</p>
           <p className="mt-3 text-base leading-7 text-slate-200">{signal.reason}</p>
+          {signal.reasons.length > 0 ? (
+            <div className="mt-3 space-y-2">
+              {signal.reasons.slice(0, 3).map((line) => (
+                <p key={line} className="text-xs leading-5 text-slate-300/90">{line}</p>
+              ))}
+            </div>
+          ) : null}
         </div>
+
+        {signal.news.hasNews || signal.news.availability === "unavailable" ? (
+          <div className="mt-6 rounded-3xl border border-white/8 bg-black/20 p-4">
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">News Context</p>
+            {signal.news.hasNews ? (
+              <>
+                <p className="mt-3 text-sm leading-6 text-slate-200">
+                  {signal.news.bullishNews ? "Structured bullish news detected." : signal.news.bearishNews ? "Structured bearish news detected." : "Structured news exists without directional edge."}
+                </p>
+                {signal.news.headline ? <p className="mt-2 text-xs leading-5 text-slate-300">{signal.news.headline}</p> : null}
+                <p className="mt-2 text-xs text-slate-400">
+                  {signal.news.source ? `${signal.news.source}` : "News feed"}{signal.news.publishedAt ? ` | ${formatTime(signal.news.publishedAt)}` : ""}
+                </p>
+              </>
+            ) : (
+              <p className="mt-3 text-sm leading-6 text-slate-300">Structured news is unavailable this cycle. News score remains neutral.</p>
+            )}
+          </div>
+        ) : null}
 
         {analysis ? (
           <div className="mt-6 rounded-3xl border border-cyan-300/15 bg-gradient-to-br from-cyan-300/10 to-transparent p-4">
@@ -84,33 +107,23 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
               <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Risk</p>
               <p className="text-sm leading-6 text-slate-200">{analysis.risk}</p>
             </div>
-            <p className="mt-4 text-xs text-slate-400">
-              Source: {analysis.source === "llm" ? "AI model" : "rules fallback"} | Grounded scanner interpretation only. Not financial advice.
-            </p>
+            <p className="mt-4 text-xs text-slate-400">Grounded interpretation only. Not financial advice.</p>
           </div>
         ) : null}
 
-        <div className="mt-6 rounded-3xl border border-white/8 bg-black/20 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Tags</p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {[...signal.reasonBadges, ...signal.tags, ...signal.riskFlags].map((tag) => (
-              <span key={tag} className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-200">
-                {tag}
-              </span>
-            ))}
-          </div>
-        </div>
-
         <div className="mt-6 rounded-3xl border border-accent-blue/15 bg-gradient-to-br from-accent-blue/10 to-transparent p-4">
           <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Score Breakdown</p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
-            <DetailMetric label="Momentum" value={String(signal.scoreBreakdown.momentum)} />
-            <DetailMetric label="Volume" value={String(signal.scoreBreakdown.volume)} />
-            <DetailMetric label="Catalyst" value={String(signal.scoreBreakdown.catalyst)} />
-            <DetailMetric label="Trend" value={String(signal.scoreBreakdown.trend)} />
-            <DetailMetric label="Freshness Penalty" value={`-${signal.scoreBreakdown.freshnessPenalty}`} />
-            <DetailMetric label="Risk Penalty" value={`-${signal.scoreBreakdown.riskPenalty}`} />
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 md:grid-cols-3">
+            <DetailMetric label="Momentum" value={String(signal.scoreBreakdown.momentumScore)} />
+            <DetailMetric label="Volume" value={String(signal.scoreBreakdown.volumeScore)} />
+            <DetailMetric label="News" value={String(signal.scoreBreakdown.newsScore)} />
+            <DetailMetric label="Trending" value={String(signal.scoreBreakdown.trendScore)} />
+            <DetailMetric label="Final" value={String(signal.scoreBreakdown.finalScore)} />
+            <DetailMetric label="Factors" value={String(signal.factorCount)} />
           </div>
+          <p className="mt-4 text-xs text-slate-400">
+            Freshness: {formatQuoteFreshness(signal.quoteFreshness)} | {signal.degraded ? "Limited this cycle" : "Live"}
+          </p>
         </div>
       </div>
     </div>

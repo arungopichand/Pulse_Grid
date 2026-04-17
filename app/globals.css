@@ -13,9 +13,9 @@ html {
 body {
   @apply min-h-screen bg-surface-950 text-slate-100 antialiased;
   background-image:
-    radial-gradient(circle at top, rgba(91, 140, 255, 0.22), transparent 28%),
-    radial-gradient(circle at 85% 20%, rgba(76, 245, 255, 0.14), transparent 22%),
-    linear-gradient(180deg, #060816 0%, #090d18 45%, #060816 100%);
+    radial-gradient(circle at 20% 0%, rgba(91, 140, 255, 0.16), transparent 35%),
+    radial-gradient(circle at 85% 10%, rgba(76, 245, 255, 0.08), transparent 28%),
+    linear-gradient(180deg, #060816 0%, #070a14 48%, #050711 100%);
 }
 
 body::before {
@@ -23,13 +23,13 @@ body::before {
   position: fixed;
   inset: 0;
   pointer-events: none;
-  background-image: linear-gradient(rgba(255, 255, 255, 0.02), transparent 45%);
-  opacity: 0.6;
+  background-image: linear-gradient(rgba(255, 255, 255, 0.015), transparent 45%);
+  opacity: 0.5;
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(91, 140, 255, 0.35) transparent;
+  scrollbar-color: rgba(91, 140, 255, 0.28) transparent;
 }
 
 ::-webkit-scrollbar {
@@ -38,12 +38,12 @@ body::before {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(91, 140, 255, 0.35);
+  background: rgba(91, 140, 255, 0.28);
   border-radius: 999px;
 }
 
 .glass-panel {
-  @apply rounded-3xl border border-white/10 bg-white/5 shadow-glow backdrop-blur-xl;
+  @apply rounded-3xl border border-white/10 bg-white/[0.035] shadow-glow backdrop-blur-xl;
 }
 
 .grid-overlay {

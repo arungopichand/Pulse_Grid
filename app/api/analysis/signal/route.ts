@@ -33,6 +33,7 @@ function isSignalAnalysisFeatures(value: unknown): value is SignalAnalysisFeatur
   return (
     typeof candidate.ticker === "string" &&
     typeof candidate.signalType === "string" &&
+    typeof candidate.confidenceLevel === "string" &&
     typeof candidate.sessionStatus === "string" &&
     typeof candidate.degraded === "boolean" &&
     typeof candidate.rank === "number" &&
@@ -41,6 +42,19 @@ function isSignalAnalysisFeatures(value: unknown): value is SignalAnalysisFeatur
     typeof candidate.changePercent === "number" &&
     typeof candidate.confidenceScore === "number" &&
     typeof candidate.scannerScore === "number" &&
+    typeof candidate.momentumScore === "number" &&
+    typeof candidate.volumeScore === "number" &&
+    typeof candidate.newsScore === "number" &&
+    typeof candidate.trendScore === "number" &&
+    typeof candidate.factorCount === "number" &&
+    typeof candidate.topOpportunity === "boolean" &&
+    typeof candidate.factors === "object" &&
+    candidate.factors !== null &&
+    typeof candidate.newsSentiment === "string" &&
+    typeof candidate.newsAvailable === "boolean" &&
+    typeof candidate.hasNews === "boolean" &&
+    typeof candidate.bullishNews === "boolean" &&
+    typeof candidate.bearishNews === "boolean" &&
     typeof candidate.streakCount === "number" &&
     Array.isArray(candidate.reasonBadges) &&
     Array.isArray(candidate.riskFlags) &&
