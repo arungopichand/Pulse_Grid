@@ -4,6 +4,7 @@ import { getMarketClock } from "./market-session";
 import { computeVolumeMovers, type VolumeMover } from "./volume-movers";
 import { fetchVolumeSnapshots, type VolumeSnapshot } from "./volume-data";
 import { fetchStructuredNewsSnapshots } from "./news-data";
+import { buildLiveEvents, type LiveEvent } from "./live-events";
 import { loadPersistedSessionState, savePersistedSessionState, type PersistedSessionState, type PersistenceStatus, type PersistedSymbolHealth, type SymbolHealthOutcome } from "./session-state-store";
 import { backupWatchlistUniverse, type WatchlistTicker, watchlistUniverse } from "./watchlist";
 
@@ -24,6 +25,7 @@ type SharedLiveStateStore = {
   quoteStates: Record<string, QuoteState>;
   observedHighs: Record<string, number | null>;
   activeSignals: Signal[];
+  events: LiveEvent[];
   volumeMoverCandidates: VolumeSnapshot[];
   volumeMovers: VolumeMover[];
   persistence: PersistenceStatus | null;
@@ -43,6 +45,7 @@ const liveStateStore: SharedLiveStateStore = {
   quoteStates: {},
   observedHighs: {},
   activeSignals: [],
+  events: [],
   volumeMoverCandidates: [],
   volumeMovers: [],
   persistence: null,
@@ -257,7 +260,7 @@ function updateSymbolHealthState(
 }
 
 function appendRecentEvaluations(state: PersistedSessionState, signals: Signal[]) {
-  for (const signal of signals) {
+  for (const [index, signal] of signals.entries()) {
     const existing = state.recentEvaluations[signal.ticker] ?? [];
     const next = [
       {
@@ -265,6 +268,8 @@ function appendRecentEvaluations(state: PersistedSessionState, signals: Signal[]
         timestamp: signal.timestamp,
         reason: signal.reason,
         confidence: signal.confidenceScore,
+        finalScore: signal.finalScore,
+        rank: index + 1,
       },
       ...existing,
     ].slice(0, 20);
@@ -349,6 +354,7 @@ function updateSharedStore(snapshot: LiveSessionSnapshot, params: {
   quoteStates: Record<string, QuoteState>;
   observedHighs: Record<string, number | null>;
   signals: Signal[];
+  events: LiveEvent[];
   volumeSnapshots: VolumeSnapshot[];
   volumeMovers: VolumeMover[];
   persistence: PersistenceStatus;
@@ -360,6 +366,7 @@ function updateSharedStore(snapshot: LiveSessionSnapshot, params: {
   liveStateStore.quoteStates = params.quoteStates;
   liveStateStore.observedHighs = params.observedHighs;
   liveStateStore.activeSignals = params.signals;
+  liveStateStore.events = params.events;
   liveStateStore.volumeMoverCandidates = params.volumeSnapshots;
   liveStateStore.volumeMovers = params.volumeMovers;
   liveStateStore.persistence = params.persistence;
@@ -439,6 +446,12 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     recentEvaluations: loaded.state.recentEvaluations,
     observedAt: generatedAt,
   });
+  const eventLayer = buildLiveEvents({
+    signals: evaluation.signals,
+    previousState: loaded.state.eventState,
+    observedAt: generatedAt,
+    degraded: !quotesResult.ok,
+  });
   const lastQuoteUpdate = getLastQuoteUpdate(quotesResult.quotes);
   const observedHighs = Object.fromEntries(
     activeUniverse.map((ticker) => [ticker.ticker, engineState.tickers[ticker.ticker]?.observedHigh ?? null]),
@@ -468,6 +481,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       tickerState: engineState.tickers,
       recentEvaluations: { ...loaded.state.recentEvaluations },
       symbolHealth,
+      eventState: eventLayer.nextState,
       lastUpdated: lastQuoteUpdate ?? loaded.state.lastUpdated,
       lastWatchlist: evaluation.watchlist.length > 0 ? evaluation.watchlist : loaded.state.lastWatchlist,
       lastSignals: loaded.state.lastSignals,
@@ -497,6 +511,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
             : createFallbackWatchlist(activeUniverse),
       lastUpdated: lastQuoteUpdate ?? loaded.state.lastUpdated,
       persistence: nextPersistenceStatus,
+      events: eventLayer.events,
+      notifications: eventLayer.notifications,
       volumeMovers,
       volumeMoversMessage,
       activeUniverseTickers: activeTickers,
@@ -511,6 +527,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       tickerState: engineState.tickers,
       recentEvaluations: { ...loaded.state.recentEvaluations },
       symbolHealth,
+      eventState: eventLayer.nextState,
       lastUpdated: evaluation.generatedAt,
       lastWatchlist: evaluation.watchlist,
       lastSignals: evaluation.signals,
@@ -546,6 +563,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       watchlist: evaluation.watchlist,
       lastUpdated: lastQuoteUpdate ?? evaluation.generatedAt,
       persistence: nextPersistenceStatus,
+      events: eventLayer.events,
+      notifications: eventLayer.notifications,
       volumeMovers,
       volumeMoversMessage,
       activeUniverseTickers: activeTickers,
@@ -560,6 +579,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quoteStates: quotesResult.quoteStates,
     observedHighs,
     signals: evaluation.signals,
+    events: eventLayer.events,
     volumeSnapshots: volumeResult.snapshots,
     volumeMovers,
     persistence: nextPersistenceStatus,
@@ -579,6 +599,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quotesFailed: quotesResult.summary.failed,
     volumeCandidates: volumeResult.snapshots.length,
     volumeMovers: volumeMovers.length,
+    events: eventLayer.events.length,
+    notifications: eventLayer.notifications.length,
   });
 
   notifyListeners(snapshot);
@@ -618,6 +640,7 @@ export function getSharedLiveStateStore() {
   return {
     ...liveStateStore,
     activeSignals: [...liveStateStore.activeSignals],
+    events: [...liveStateStore.events],
     volumeMovers: [...liveStateStore.volumeMovers],
     volumeMoverCandidates: [...liveStateStore.volumeMoverCandidates],
     latestQuotes: [...liveStateStore.latestQuotes],
@@ -644,6 +667,7 @@ export function __resetLiveSessionRuntimeForTests() {
   liveStateStore.quoteStates = {};
   liveStateStore.observedHighs = {};
   liveStateStore.activeSignals = [];
+  liveStateStore.events = [];
   liveStateStore.volumeMoverCandidates = [];
   liveStateStore.volumeMovers = [];
   liveStateStore.persistence = null;

@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { get, put } from "@vercel/blob";
 import type { Signal, TickerEvaluationState, WatchlistQuote } from "./live-signal-engine";
+import type { PersistedEventState } from "./live-events";
 
 type LegacyObservation = {
   price: number;
@@ -14,6 +15,8 @@ export type PersistedRecentEvaluation = {
   timestamp: string;
   reason: string;
   confidence: number;
+  finalScore?: number;
+  rank?: number;
 };
 
 export type SymbolHealthOutcome =
@@ -43,6 +46,7 @@ export type PersistedSessionState = {
   tickerState: Record<string, TickerEvaluationState>;
   recentEvaluations: Record<string, PersistedRecentEvaluation[]>;
   symbolHealth: Record<string, PersistedSymbolHealth>;
+  eventState: PersistedEventState;
   lastUpdated: string | null;
   lastWatchlist: WatchlistQuote[];
   lastSignals: Signal[];
@@ -80,6 +84,13 @@ function createEmptyState(sessionDate: string): PersistedSessionState {
     tickerState: {},
     recentEvaluations: {},
     symbolHealth: {},
+    eventState: {
+      recentEvents: [],
+      lastNotifiedByKey: {},
+      lastNotificationBySymbol: {},
+      lastSignalBySymbol: {},
+      topSymbol: null,
+    },
     lastUpdated: null,
     lastWatchlist: [],
     lastSignals: [],
@@ -259,6 +270,12 @@ function shouldPersistState(previous: PersistedSessionState, next: PersistedSess
     }
   }
 
+  const previousEventKey = previous.eventState.recentEvents.slice(0, 12).map((event) => event.id).join("|");
+  const nextEventKey = next.eventState.recentEvents.slice(0, 12).map((event) => event.id).join("|");
+  if (previousEventKey !== nextEventKey) {
+    return true;
+  }
+
   return false;
 }
 
@@ -292,6 +309,22 @@ export async function loadPersistedSessionState(sessionDate: string): Promise<Lo
         tickerState: migrateTickerState(stored.tickerState, stored.history ?? {}),
         recentEvaluations: stored.recentEvaluations ?? {},
         symbolHealth: stored.symbolHealth ?? {},
+        eventState: stored.eventState
+          ? {
+              ...stored.eventState,
+              lastNotifiedByKey: stored.eventState.lastNotifiedByKey ?? {},
+              lastNotificationBySymbol: stored.eventState.lastNotificationBySymbol ?? {},
+              lastSignalBySymbol: stored.eventState.lastSignalBySymbol ?? {},
+              topSymbol: stored.eventState.topSymbol ?? null,
+              recentEvents: stored.eventState.recentEvents ?? [],
+            }
+          : {
+              recentEvents: [],
+              lastNotifiedByKey: {},
+              lastNotificationBySymbol: {},
+              lastSignalBySymbol: {},
+              topSymbol: null,
+            },
         lastWatchlist: stored.lastWatchlist ?? [],
         lastSignals: stored.lastSignals ?? [],
       },

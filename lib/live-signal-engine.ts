@@ -66,6 +66,15 @@ export type Signal = {
   currentVolume: number | null;
   averageVolume: number | null;
   streakCount: number;
+  reappearance: {
+    isReappearing: boolean;
+    strongerReappearance: boolean;
+    label: "Back again" | "Reappearing" | "Building" | null;
+    scoreBoost: number;
+    lastSeenAt: string | null;
+    lastScore: number | null;
+    lastRank: number | null;
+  };
   floatShares: number | null;
   riskFlags: string[];
 };
@@ -115,6 +124,10 @@ const STRONG_MOVE_SCORE = 40;
 const VOLUME_SPIKE_SCORE = 30;
 const NEWS_SCORE = 30;
 const TREND_SCORE = 20;
+const REAPPEARANCE_WINDOW_MS = 8 * 60_000;
+const REAPPEARANCE_BOOST = 5;
+const STRONG_REAPPEARANCE_BOOST = 10;
+const STRONG_REAPPEARANCE_DELTA = 8;
 
 function roundMetric(value: number, digits = 1) {
   const factor = 10 ** digits;
@@ -251,6 +264,9 @@ export function evaluateLiveSignals(params: {
       canEvaluate && previousObservedHigh && quote.price > previousObservedHigh
         ? ((quote.price - previousObservedHigh) / previousObservedHigh) * 100
         : 0;
+    const latestRecentEvaluation = recentEvaluations[tickerMeta.ticker]?.[0];
+    const lastSeenAt = latestRecentEvaluation?.timestamp ?? null;
+    const lastSeenAgeMs = lastSeenAt ? Math.max(0, new Date(observedAt).getTime() - new Date(lastSeenAt).getTime()) : null;
     const reasonBadges: string[] = [];
     const reasons: string[] = [];
     const tags = ["Live", "Penny Scan"];
@@ -369,7 +385,13 @@ export function evaluateLiveSignals(params: {
     const volumeScore = hasVolumeSpike ? VOLUME_SPIKE_SCORE : 0;
     const newsScore = hasDirectionalNews ? NEWS_SCORE : 0;
     const trendScore = hasTrending ? TREND_SCORE : 0;
-    const finalScore = momentumScore + volumeScore + newsScore + trendScore;
+    const baseFinalScore = momentumScore + volumeScore + newsScore + trendScore;
+    const lastScore = latestRecentEvaluation?.finalScore ?? null;
+    const scoreDeltaFromLast = lastScore !== null ? baseFinalScore - lastScore : 0;
+    const isReappearing = Boolean(lastSeenAgeMs !== null && lastSeenAgeMs >= REAPPEARANCE_WINDOW_MS);
+    const strongerReappearance = isReappearing && scoreDeltaFromLast >= STRONG_REAPPEARANCE_DELTA;
+    const reappearanceScoreBoost = strongerReappearance ? STRONG_REAPPEARANCE_BOOST : isReappearing ? REAPPEARANCE_BOOST : 0;
+    const finalScore = baseFinalScore + reappearanceScoreBoost;
     const confidence = getSignalConfidence(factorCount);
     const confidenceScore = getConfidenceScore(confidence);
 
@@ -378,6 +400,26 @@ export function evaluateLiveSignals(params: {
         ? "BULLISH"
         : "BEARISH"
       : "SPIKE";
+
+    const reappearanceLabel: Signal["reappearance"]["label"] = strongerReappearance
+      ? "Back again"
+      : isReappearing
+        ? hasTrending
+          ? "Building"
+          : "Reappearing"
+        : null;
+
+    if (reappearanceLabel) {
+      reasonBadges.push(reappearanceLabel);
+      reasons.push(
+        strongerReappearance
+          ? "This symbol is back with stronger confluence than its prior appearance."
+          : "This symbol has returned to the scanner after a meaningful absence.",
+      );
+      if (!tags.includes("Reappearance")) {
+        tags.push("Reappearance");
+      }
+    }
 
     const reason = createReasonSummary(reasonBadges);
 
@@ -441,6 +483,15 @@ export function evaluateLiveSignals(params: {
         currentVolume: volumeSnapshot?.currentVolume ?? null,
         averageVolume: volumeSnapshot?.averageVolume ?? null,
         streakCount,
+        reappearance: {
+          isReappearing,
+          strongerReappearance,
+          label: reappearanceLabel,
+          scoreBoost: reappearanceScoreBoost,
+          lastSeenAt,
+          lastScore,
+          lastRank: latestRecentEvaluation?.rank ?? null,
+        },
         floatShares: tickerMeta.floatShares ?? null,
         riskFlags: tickerMeta.riskFlags ?? [],
       });

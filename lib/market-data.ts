@@ -96,6 +96,8 @@ export type LiveSessionSnapshot =
       watchlist: import("./live-signal-engine").WatchlistQuote[];
       lastUpdated: string | null;
       persistence: import("./session-state-store").PersistenceStatus;
+      events: import("./live-events").LiveEvent[];
+      notifications: import("./live-events").LiveEvent[];
       volumeMovers: import("./volume-movers").VolumeMover[];
       volumeMoversMessage: string | null;
       activeUniverseTickers?: string[];
@@ -115,6 +117,8 @@ export type LiveSessionSnapshot =
       watchlist: import("./live-signal-engine").WatchlistQuote[];
       lastUpdated: string | null;
       persistence: import("./session-state-store").PersistenceStatus;
+      events: import("./live-events").LiveEvent[];
+      notifications: import("./live-events").LiveEvent[];
       volumeMovers: import("./volume-movers").VolumeMover[];
       volumeMoversMessage: string | null;
       activeUniverseTickers?: string[];
@@ -1185,6 +1189,8 @@ export async function fetchLiveSessionSnapshot(options?: { signal?: AbortSignal 
         message: "Live session persistence status is unavailable.",
         lastPersistedAt: null,
       },
+      events: [],
+      notifications: [],
       volumeMovers: [],
       volumeMoversMessage: "Volume Movers data is temporarily unavailable.",
     };

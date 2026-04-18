@@ -57,6 +57,7 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
           <DetailMetric label="RVOL" value={signal.relativeVolume !== null ? `${signal.relativeVolume.toFixed(2)}x` : "n/a"} />
           <DetailMetric label="Alert Time" value={formatTime(signal.timestamp)} />
           <DetailMetric label="Quote State" value={formatQuoteFreshness(signal.quoteFreshness)} toneClass={quoteFreshnessTone(signal.quoteFreshness)} />
+          {signal.reappearance.label ? <DetailMetric label="Reappearance" value={signal.reappearance.label} /> : null}
         </div>
 
         <div className="mt-6 rounded-3xl border border-white/8 bg-black/20 p-4">
@@ -120,6 +121,7 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
             <DetailMetric label="Trending" value={String(signal.scoreBreakdown.trendScore)} />
             <DetailMetric label="Final" value={String(signal.scoreBreakdown.finalScore)} />
             <DetailMetric label="Factors" value={String(signal.factorCount)} />
+            {signal.reappearance.scoreBoost > 0 ? <DetailMetric label="Reappear Boost" value={`+${signal.reappearance.scoreBoost}`} /> : null}
           </div>
           <p className="mt-4 text-xs text-slate-400">
             Freshness: {formatQuoteFreshness(signal.quoteFreshness)} | {signal.degraded ? "Limited this cycle" : "Live"}

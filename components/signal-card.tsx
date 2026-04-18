@@ -8,7 +8,7 @@ type SignalCardProps = {
   onClick: () => void;
   featured?: boolean;
   compact?: boolean;
-  liveCue?: "New" | "Rising" | "Cooling" | "Moved up" | "Moved down" | null;
+  liveCue?: "New" | "Rising" | "Cooling" | "Moved up" | "Moved down" | "Back again" | "Reappearing" | "Building" | null;
   recentlyChanged?: boolean;
 };
 
@@ -17,7 +17,7 @@ function liveCueTone(liveCue: NonNullable<SignalCardProps["liveCue"]>) {
     return "border-cyan-300/25 bg-cyan-300/10 text-cyan-100";
   }
 
-  if (liveCue === "Rising" || liveCue === "Moved up") {
+  if (liveCue === "Rising" || liveCue === "Moved up" || liveCue === "Back again" || liveCue === "Building") {
     return "border-emerald-300/25 bg-emerald-300/10 text-emerald-100";
   }
 

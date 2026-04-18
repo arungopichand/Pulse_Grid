@@ -62,6 +62,35 @@ npm run start
 - `BULLISH` and `BEARISH` signal types fire only from structured directional news, otherwise `SPIKE` remains the main type.
 - If structured news is unavailable for a cycle, the engine stays honest and keeps newsScore neutral.
 
+## Live Event Layer
+
+- Event normalization and deterministic notify rules live in [lib/live-events.ts](/c:/Users/arung/Pulse_Grid/lib/live-events.ts).
+- Runtime integration lives in [lib/live-session-runtime.ts](/c:/Users/arung/Pulse_Grid/lib/live-session-runtime.ts).
+- UI live tape lives in [components/live-event-feed.tsx](/c:/Users/arung/Pulse_Grid/components/live-event-feed.tsx).
+- High-priority in-app alerts are fed through [components/toast-stack.tsx](/c:/Users/arung/Pulse_Grid/components/toast-stack.tsx).
+- Event dedup + cooldown state is persisted with session state in [lib/session-state-store.ts](/c:/Users/arung/Pulse_Grid/lib/session-state-store.ts).
+
+### Supported event types now
+
+- `TOP_SETUP` (scanner-driven)
+- `PRICE_SPIKE` (scanner-driven)
+- `VOLUME_SPIKE` (scanner-driven)
+- `REAPPEAR` (scanner-driven)
+- `BULLISH_SIGNAL` (scanner + structured directional news)
+- `BEARISH_SIGNAL` (scanner + structured directional news)
+- `NEWS` (structured provider news context)
+
+### Scaffolded but not yet provider-backed
+
+- `SEC_FILING`
+- `OFFERING`
+- `REVERSE_SPLIT`
+- `HALT`
+- `FDA`
+- `EARNINGS`
+
+These are defined in the normalized model but are not emitted until a reliable structured provider path is added.
+
 ## AI layer
 
 - AI orchestration service lives in [lib/ai/signal-analysis-layer.ts](/c:/Users/arung/Pulse_Grid/lib/ai/signal-analysis-layer.ts).
