@@ -2,7 +2,7 @@ export type WatchlistTicker = {
   ticker: string;
   company: string;
   sector: string;
-  exchange: "NASDAQ" | "NYSE" | "AMEX";
+  exchange: "NASDAQ" | "NYSE" | "AMEX" | "UNKNOWN";
   instrumentType: "Common Stock";
   country: "US";
   floatShares?: number | null;

@@ -1,17 +1,27 @@
 import { createLiveSignalEngineState, evaluateLiveSignals, type Signal } from "./live-signal-engine";
-import { getMarketDataThresholds, marketDataProvider, type LiveSessionSnapshot, type QuoteSnapshot, type QuoteState, fetchFinnhubQuotes } from "./market-data";
+import { type LiveSessionSnapshot, type QuoteSnapshot, type QuoteState } from "./market-data";
 import { getMarketClock } from "./market-session";
 import { computeVolumeMovers, type VolumeMover } from "./volume-movers";
-import { fetchVolumeSnapshots, type VolumeSnapshot } from "./volume-data";
-import { fetchStructuredNewsSnapshots } from "./news-data";
+import type { VolumeSnapshot } from "./volume-data";
+import { fetchStructuredNewsSnapshots, type StructuredNewsSnapshot } from "./news-data";
 import { buildLiveEvents, type LiveEvent } from "./live-events";
 import { loadPersistedSessionState, savePersistedSessionState, type PersistedSessionState, type PersistenceStatus, type PersistedSymbolHealth, type SymbolHealthOutcome } from "./session-state-store";
-import { backupWatchlistUniverse, type WatchlistTicker, watchlistUniverse } from "./watchlist";
+import {
+  getDynamicUniverse as getDynamicUniverseFromStream,
+  getMarketSnapshot,
+  getMarketStreamHealth,
+  getVolumeSnapshotsForSymbols,
+  startMarketStream,
+} from "./market-stream";
+import type { WatchlistTicker } from "./watchlist";
 
-const LIVE_SESSION_FAST_INTERVAL_MS = 4_000;
-const LIVE_SESSION_IDLE_INTERVAL_MS = marketDataProvider.pollIntervalMs;
+const LIVE_SESSION_FAST_INTERVAL_MS = 2_000;
+const LIVE_SESSION_IDLE_INTERVAL_MS = 5_000;
 const LIVE_SESSION_ACTIVE_DEMAND_WINDOW_MS = 60_000;
 const LIVE_SESSION_FAST_LANE_VOLUME_COUNT = 4;
+const DYNAMIC_UNIVERSE_TARGET_SIZE = 50;
+const UNIVERSE_REFRESH_INTERVAL_MS = 60_000;
+const NEWS_REFRESH_INTERVAL_MS = 90_000;
 const SYMBOL_HEALTH_WINDOW = 6;
 const SYMBOL_COLD_DURATION_MS = 12 * 60_000;
 const SYMBOL_SELECTION_STICKINESS_MS = 8 * 60_000;
@@ -61,6 +71,23 @@ let latestPersistenceStatus: PersistenceStatus | null = null;
 let cyclePromise: Promise<LiveSessionSnapshot> | null = null;
 let nextCycleTimer: ReturnType<typeof setTimeout> | null = null;
 let lastDemandAt = 0;
+let cachedUniverseCandidates: WatchlistTicker[] = [];
+let cachedUniverseDiscovery: {
+  source: "live" | "cache" | "fallback_empty";
+  discoveredCount: number;
+  selectedCount: number;
+  topSymbols: string[];
+  reasonsBySymbol: Record<string, string>;
+} = {
+  source: "fallback_empty",
+  discoveredCount: 0,
+  selectedCount: 0,
+  topSymbols: [],
+  reasonsBySymbol: {},
+};
+let nextUniverseRefreshAt = 0;
+let cachedNewsByTicker = new Map<string, StructuredNewsSnapshot>();
+let nextNewsRefreshAt = 0;
 
 function createEmptySymbolHealth(): PersistedSymbolHealth {
   return {
@@ -70,10 +97,6 @@ function createEmptySymbolHealth(): PersistedSymbolHealth {
     lastIncludedAt: null,
     coldUntil: null,
   };
-}
-
-function isCoreTicker(ticker: string) {
-  return watchlistUniverse.some((entry) => entry.ticker === ticker);
 }
 
 function isSevereOutcome(outcome: SymbolHealthOutcome) {
@@ -127,7 +150,7 @@ function scoreTickerHealth(ticker: WatchlistTicker, health: PersistedSymbolHealt
   const recentSevereFailures = symbolHealth.recentOutcomes.slice(0, 4).filter((item) => isSevereOutcome(item.outcome)).length;
   const recentHealthyCycles = symbolHealth.recentOutcomes.slice(0, 4).filter((item) => isHealthyOutcome(item.outcome)).length;
 
-  let score = isCoreTicker(ticker.ticker) ? 28 : 12;
+  let score = 20;
   score += recentScore;
   score += getAgeBoost(symbolHealth.lastHealthyAt, nowMs, [
     { maxAgeMs: 10 * 60_000, score: 12 },
@@ -145,10 +168,13 @@ function scoreTickerHealth(ticker: WatchlistTicker, health: PersistedSymbolHealt
   return score;
 }
 
-function selectActiveUniverse(state: PersistedSessionState, observedAt: string) {
+function selectActiveUniverse(
+  state: PersistedSessionState,
+  observedAt: string,
+  candidates: WatchlistTicker[],
+  targetSize: number,
+) {
   const nowMs = new Date(observedAt).getTime();
-  const targetSize = watchlistUniverse.length;
-  const candidates = [...watchlistUniverse, ...backupWatchlistUniverse];
   const rankedCandidates = [...candidates].sort((left, right) => {
     const leftScore = scoreTickerHealth(left, state.symbolHealth[left.ticker], nowMs);
     const rightScore = scoreTickerHealth(right, state.symbolHealth[right.ticker], nowMs);
@@ -157,22 +183,14 @@ function selectActiveUniverse(state: PersistedSessionState, observedAt: string) 
       return rightScore - leftScore;
     }
 
-    if (isCoreTicker(left.ticker) !== isCoreTicker(right.ticker)) {
-      return Number(isCoreTicker(right.ticker)) - Number(isCoreTicker(left.ticker));
-    }
-
     return left.ticker.localeCompare(right.ticker);
   });
 
-  const activeUniverse = rankedCandidates.slice(0, targetSize);
-  const activeTickerSet = new Set(activeUniverse.map((ticker) => ticker.ticker));
-  const displacedCore = watchlistUniverse.filter((ticker) => !activeTickerSet.has(ticker.ticker));
-  const promotedBackups = activeUniverse.filter((ticker) => !isCoreTicker(ticker.ticker));
-  const universeAdjusted = displacedCore.length > 0 || promotedBackups.length > 0;
+  const cappedTarget = Math.max(0, targetSize);
+  const activeUniverse = rankedCandidates.slice(0, cappedTarget);
+  const universeAdjusted = rankedCandidates.length > activeUniverse.length;
   const universeMessage = universeAdjusted
-    ? promotedBackups.length > 0
-      ? `Universe adjusted for live coverage with ${promotedBackups.length} healthier backup ${promotedBackups.length === 1 ? "name" : "names"}.`
-      : "Universe adjusted for live coverage."
+    ? `Dynamic universe capped to ${activeUniverse.length} symbols from ${rankedCandidates.length} discovered names.`
     : null;
 
   return {
@@ -290,7 +308,34 @@ function createFallbackWatchlist(universe: WatchlistTicker[]) {
   }));
 }
 
-function buildDegradedSessionMessage(quotesResult: Awaited<ReturnType<typeof fetchFinnhubQuotes>>) {
+function createFallbackUniverseFromPersistedState(state: PersistedSessionState) {
+  const fallback: WatchlistTicker[] = [];
+
+  for (const item of state.lastWatchlist) {
+    if (!item.ticker) continue;
+    fallback.push({
+      ticker: item.ticker,
+      company: item.company,
+      sector: item.sector,
+      exchange: item.exchange,
+      instrumentType: item.instrumentType,
+      country: item.country,
+      floatShares: item.floatShares ?? null,
+      riskFlags: item.riskFlags ?? [],
+    });
+  }
+
+  return fallback;
+}
+
+function buildDegradedSessionMessage(quotesResult: {
+  ok: boolean;
+  reason?: string;
+  summary: {
+    cached: number;
+    fresh: number;
+  };
+}) {
   const cachedQuotes = quotesResult.summary.cached;
   const freshQuotes = quotesResult.summary.fresh;
 
@@ -397,26 +442,78 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   const startedAt = Date.now();
   const marketClock = getMarketClock();
   const loaded = await ensurePersistedState(marketClock.sessionDate);
-  const universeSelection = selectActiveUniverse(loaded.state, new Date(startedAt).toISOString());
+  await startMarketStream();
+
+  if (Date.now() >= nextUniverseRefreshAt || cachedUniverseCandidates.length === 0) {
+    const dynamicUniverse = getDynamicUniverseFromStream();
+    cachedUniverseCandidates = dynamicUniverse.symbols;
+    cachedUniverseDiscovery = {
+      source: dynamicUniverse.source,
+      discoveredCount: dynamicUniverse.discoveredCount,
+      selectedCount: dynamicUniverse.selectedCount,
+      topSymbols: dynamicUniverse.topSymbols,
+      reasonsBySymbol: dynamicUniverse.reasonsBySymbol,
+    };
+    nextUniverseRefreshAt = Date.now() + UNIVERSE_REFRESH_INTERVAL_MS;
+  }
+
+  const discoveredCandidates =
+    cachedUniverseCandidates.length > 0
+      ? cachedUniverseCandidates
+      : createFallbackUniverseFromPersistedState(loaded.state);
+  const universeSelection = selectActiveUniverse(
+    loaded.state,
+    new Date(startedAt).toISOString(),
+    discoveredCandidates,
+    DYNAMIC_UNIVERSE_TARGET_SIZE,
+  );
   const activeUniverse = universeSelection.activeUniverse;
   const activeTickers = activeUniverse.map((ticker) => ticker.ticker);
   const fastLaneTickers = deriveFastLaneTickers();
-  const quoteThresholds = getMarketDataThresholds();
 
-  const [quotesResult, volumeResult, newsResult] = await Promise.all([
-    fetchFinnhubQuotes(activeTickers, {
-      prioritizedTickers: fastLaneTickers,
-      fastLaneTickers,
-      slowLaneBatchSize: quoteThresholds.refreshBatchSize,
-    }),
-    fetchVolumeSnapshots(activeTickers, {
-      prioritizedTickers: fastLaneTickers,
-      fastLaneTickers,
-    }),
-    fetchStructuredNewsSnapshots(activeTickers, {
-      prioritizedTickers: fastLaneTickers,
-    }),
-  ]);
+  const quoteSnapshot = getMarketSnapshot(activeTickers);
+  const streamHealth = getMarketStreamHealth();
+  const quotesResult = {
+    ok: quoteSnapshot.quotes.length > 0,
+    degraded: quoteSnapshot.degraded || streamHealth.degraded,
+    reason: quoteSnapshot.quotes.length > 0 ? undefined : "stream_unavailable",
+    message:
+      quoteSnapshot.quotes.length > 0
+        ? "Live data served from shared market stream."
+        : "Shared market stream has no quote data yet.",
+    retryAfterMs: getActiveDemandIntervalMs(),
+    quotes: quoteSnapshot.quotes,
+    summary: quoteSnapshot.summary,
+    quoteStates: quoteSnapshot.quoteStates,
+    cacheTtlMs: quoteSnapshot.cacheTtlMs,
+    staleAfterMs: quoteSnapshot.staleAfterMs,
+    refreshBatchSize: quoteSnapshot.refreshBatchSize,
+  };
+
+  const volumeSnapshots = getVolumeSnapshotsForSymbols(activeTickers);
+  const volumeResult = {
+    ok: true,
+    snapshots: volumeSnapshots,
+    message: null as string | null,
+  };
+
+  if (Date.now() >= nextNewsRefreshAt) {
+    try {
+      const newsResult = await fetchStructuredNewsSnapshots(activeTickers, {
+        prioritizedTickers: fastLaneTickers,
+      });
+      cachedNewsByTicker = new Map(newsResult.snapshots.map((item) => [item.ticker, item]));
+    } catch (error) {
+      console.warn("[live-session-runtime]", "news_refresh_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    nextNewsRefreshAt = Date.now() + NEWS_REFRESH_INTERVAL_MS;
+  }
+
+  const newsSnapshots = activeTickers
+    .map((ticker) => cachedNewsByTicker.get(ticker))
+    .filter((item): item is StructuredNewsSnapshot => Boolean(item));
 
   const volumeMovers = volumeResult.ok ? computeVolumeMovers(volumeResult.snapshots) : [];
   const volumeMoversMessage =
@@ -442,7 +539,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     watchlist: activeUniverse,
     quotes: quotesResult.quotes,
     volumeSnapshots: volumeResult.snapshots,
-    newsSnapshots: newsResult.snapshots,
+    newsSnapshots,
     recentEvaluations: loaded.state.recentEvaluations,
     observedAt: generatedAt,
   });
@@ -587,6 +684,26 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   });
 
   console.log("[live-session-runtime]", "cycle", {
+    universeDiscovery: {
+      source: cachedUniverseDiscovery.source,
+      discoveredCount: cachedUniverseDiscovery.discoveredCount,
+      selectedCount: cachedUniverseDiscovery.selectedCount,
+      topSymbols: cachedUniverseDiscovery.topSymbols.slice(0, 8),
+      topReasons: Object.fromEntries(
+        cachedUniverseDiscovery.topSymbols.slice(0, 5).map((symbol) => [
+          symbol,
+          cachedUniverseDiscovery.reasonsBySymbol[symbol] ?? "reason_unavailable",
+        ]),
+      ),
+    },
+    exclusionCounts: evaluation.watchlist.reduce(
+      (acc, item) => {
+        const key = item.exclusionReason ?? "none";
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>,
+    ),
     latencyMs: Date.now() - startedAt,
     degraded: snapshot.degraded,
     version: liveStateStore.version,
@@ -661,6 +778,17 @@ export function __resetLiveSessionRuntimeForTests() {
   lastDemandAt = 0;
   persistedState = null;
   latestPersistenceStatus = null;
+  cachedUniverseCandidates = [];
+  cachedUniverseDiscovery = {
+    source: "fallback_empty",
+    discoveredCount: 0,
+    selectedCount: 0,
+    topSymbols: [],
+    reasonsBySymbol: {},
+  };
+  nextUniverseRefreshAt = 0;
+  cachedNewsByTicker = new Map();
+  nextNewsRefreshAt = 0;
   liveStateStore.version = 0;
   liveStateStore.snapshot = null;
   liveStateStore.latestQuotes = [];

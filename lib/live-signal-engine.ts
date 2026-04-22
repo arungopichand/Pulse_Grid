@@ -35,6 +35,16 @@ export type SignalScoreBreakdown = {
   finalScore: number;
 };
 
+export type SignalQualityDebug = {
+  baseScore: number;
+  rvolBoost: number;
+  accelerationBoost: number;
+  finalScore: number;
+  confidence: SignalConfidence;
+  relativeVolume: number | null;
+  isAccelerating: boolean;
+};
+
 export type Signal = {
   id: string;
   ticker: string;
@@ -77,6 +87,7 @@ export type Signal = {
   };
   floatShares: number | null;
   riskFlags: string[];
+  qualityDebug?: SignalQualityDebug;
 };
 
 export type WatchlistQuote = WatchlistTicker & {
@@ -97,6 +108,7 @@ export type TickerEvaluationState = {
   observedHigh: number | null;
   lastQuoteTimestamp: string | null;
   lastEvaluatedAt: string | null;
+  lastChangePercent?: number | null;
   lastSignals: SignalType[];
 };
 
@@ -111,15 +123,17 @@ export type LiveSignalEngineOutput = {
 };
 
 const DEFAULT_PRICE_CAP = 5;
-const STRONG_MOVE_THRESHOLD = 4;
+const STRONG_MOVE_THRESHOLD = 3;
 const BREAKOUT_THRESHOLD_PERCENT = 0.45;
 const STRONG_TREND_THRESHOLD_PERCENT = 1;
-const MIN_CURRENT_VOLUME = 300_000;
-const MIN_AVERAGE_VOLUME = 250_000;
-const MIN_RELATIVE_VOLUME = 1.8;
-const MIN_DOLLAR_LIQUIDITY = 750_000;
+const MIN_CURRENT_VOLUME = 120_000;
+const MIN_AVERAGE_VOLUME = 100_000;
+const MIN_RELATIVE_VOLUME = 1.35;
+const MIN_DOLLAR_LIQUIDITY = 200_000;
 const RECENT_STRENGTH_WINDOW_MS = 20 * 60_000;
-const MIN_VISIBLE_SCORE = 60;
+const MIN_VISIBLE_SCORE = 62;
+const MOMENTUM_ONLY_VISIBLE_SCORE = 40;
+const MOMENTUM_ONLY_STRONG_MOVE_THRESHOLD = 3.5;
 const STRONG_MOVE_SCORE = 40;
 const VOLUME_SPIKE_SCORE = 30;
 const NEWS_SCORE = 30;
@@ -185,6 +199,18 @@ function getConfidenceScore(confidence: SignalConfidence) {
   }
 
   return 62;
+}
+
+function getConfidenceFromScore(score: number): SignalConfidence {
+  if (score >= 85) {
+    return "HIGH";
+  }
+
+  if (score >= 67) {
+    return "MEDIUM";
+  }
+
+  return "LOW";
 }
 
 function mapStructuredNewsSentiment(news: SignalNewsContext): SignalNewsSentiment {
@@ -253,6 +279,7 @@ export function evaluateLiveSignals(params: {
 
     const priorTickerState = state.tickers[tickerMeta.ticker] ?? createDefaultTickerState();
     const previousObservedHigh = priorTickerState.observedHigh;
+    const previousChangePercent = priorTickerState.lastChangePercent ?? null;
     const signalFreshness = quote.freshness === "fresh" ? "fresh" : quote.freshness === "cached" ? "cached" : null;
     const canEvaluate = signalFreshness !== null;
     const volumeSnapshot = volumeMap.get(tickerMeta.ticker);
@@ -284,6 +311,10 @@ export function evaluateLiveSignals(params: {
       dollarLiquidity >= MIN_DOLLAR_LIQUIDITY;
     const hasStrongMove = canEvaluate && quote.changePercent >= STRONG_MOVE_THRESHOLD;
     const hasVolumeSpike = hasLiquidity && relativeVolume !== null && relativeVolume >= MIN_RELATIVE_VOLUME;
+    const hasAcceleratingMove =
+      canEvaluate &&
+      typeof previousChangePercent === "number" &&
+      quote.changePercent > previousChangePercent;
     const hasTrending = canEvaluate && (streakCount >= 2 || breakoutPercent >= BREAKOUT_THRESHOLD_PERCENT);
     const hasTrendQuality = streakCount >= 2 || breakoutPercent >= STRONG_TREND_THRESHOLD_PERCENT;
     const structuredNews = newsMap.get(tickerMeta.ticker);
@@ -392,8 +423,22 @@ export function evaluateLiveSignals(params: {
     const strongerReappearance = isReappearing && scoreDeltaFromLast >= STRONG_REAPPEARANCE_DELTA;
     const reappearanceScoreBoost = strongerReappearance ? STRONG_REAPPEARANCE_BOOST : isReappearing ? REAPPEARANCE_BOOST : 0;
     const finalScore = baseFinalScore + reappearanceScoreBoost;
-    const confidence = getSignalConfidence(factorCount);
-    const confidenceScore = getConfidenceScore(confidence);
+    const baseConfidence = getSignalConfidence(factorCount);
+    const baseConfidenceScore = getConfidenceScore(baseConfidence);
+    const rvolBoost = relativeVolume !== null && relativeVolume > 1.5 ? 5 : 0;
+    const accelerationBoost = hasAcceleratingMove ? 5 : 0;
+    const confidenceBoost = rvolBoost + accelerationBoost;
+    const confidenceScore = Math.min(99, baseConfidenceScore + confidenceBoost);
+    const confidence = getConfidenceFromScore(confidenceScore);
+    const qualityDebug: SignalQualityDebug = {
+      baseScore: baseConfidenceScore,
+      rvolBoost,
+      accelerationBoost,
+      finalScore: confidenceScore,
+      confidence,
+      relativeVolume: relativeVolume !== null ? roundMetric(relativeVolume, 2) : null,
+      isAccelerating: hasAcceleratingMove,
+    };
 
     const activeSignalType: SignalType = hasDirectionalNews
       ? newsSentiment === "bullish"
@@ -427,9 +472,18 @@ export function evaluateLiveSignals(params: {
       canEvaluate &&
       isPennyCandidate &&
       hasLiquidity &&
-      factorCount >= 2 &&
-      hasTrendQuality &&
-      finalScore >= MIN_VISIBLE_SCORE &&
+      (
+        (
+          factorCount >= 2 &&
+          (hasTrendQuality || hasVolumeSpike) &&
+          finalScore >= MIN_VISIBLE_SCORE
+        ) ||
+        (
+          hasStrongMove &&
+          quote.changePercent >= MOMENTUM_ONLY_STRONG_MOVE_THRESHOLD &&
+          finalScore >= MOMENTUM_ONLY_VISIBLE_SCORE
+        )
+      ) &&
       Boolean(activeSignalType);
 
     if (!shouldSurfaceSignal && !exclusionReason) {
@@ -494,6 +548,7 @@ export function evaluateLiveSignals(params: {
         },
         floatShares: tickerMeta.floatShares ?? null,
         riskFlags: tickerMeta.riskFlags ?? [],
+        qualityDebug,
       });
     }
 
@@ -502,6 +557,7 @@ export function evaluateLiveSignals(params: {
           observedHigh: Math.max(previousObservedHigh ?? quote.price, quote.price),
           lastQuoteTimestamp: quote.timestamp,
           lastEvaluatedAt: observedAt,
+          lastChangePercent: quote.changePercent,
           lastSignals: shouldSurfaceSignal && activeSignalType ? [activeSignalType] : [],
         }
       : {

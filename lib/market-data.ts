@@ -259,7 +259,7 @@ function buildFinnhubQuoteUrl(ticker: string) {
     token: getFinnhubApiKey(),
   });
 
-  return `${marketDataProvider.baseUrl}/quote?${params.toString()}`;
+  return `https://finnhub.io/api/v1/quote?${params.toString()}`;
 }
 
 function buildTwelveDataQuoteUrl(ticker: string) {
@@ -404,7 +404,7 @@ function toCacheEntry(quote: QuoteSnapshot): CachedQuoteEntry {
 }
 
 function quoteAgeMs(entry: CachedQuoteEntry, now: number) {
-  return Math.max(0, now - new Date(entry.timestamp).getTime());
+  return Math.max(0, now - entry.cachedAt);
 }
 
 function quoteCacheAgeMs(entry: CachedQuoteEntry, now: number) {
@@ -1218,7 +1218,10 @@ export async function fetchFinnhubQuotes(
 
   const uniqueTickers = Array.from(new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean)));
   const startedAt = Date.now();
-  const slowLaneBatchSize = options?.slowLaneBatchSize ?? getRefreshBatchSize();
+  const configuredSlowLaneBatchSize = options?.slowLaneBatchSize ?? getRefreshBatchSize();
+  const uncachedTickers = uniqueTickers.filter((ticker) => !quoteCache.has(ticker));
+  const slowLaneBatchSize =
+    uncachedTickers.length === uniqueTickers.length ? uniqueTickers.length : configuredSlowLaneBatchSize;
   const prioritizedTickers = prioritizeTickers(uniqueTickers, options?.prioritizedTickers?.map((ticker) => ticker.trim().toUpperCase()) ?? []);
   const fastLaneTickers = Array.from(
     new Set(
@@ -1238,6 +1241,7 @@ export async function fetchFinnhubQuotes(
   const slowLaneUniverse = prioritizedTickers.filter((ticker) => !fastLaneSet.has(ticker));
   const slowLaneRotation = new Set(chooseTickersToRefresh(slowLaneUniverse, slowLaneBatchSize));
   const fastLaneRefreshes: string[] = [];
+  const staleSlowLane: string[] = [];
   const missingSlowLane: string[] = [];
   const rotatedSlowLaneRefreshes: string[] = [];
 
@@ -1269,6 +1273,15 @@ export async function fetchFinnhubQuotes(
       summary.servedFromCache += 1;
     }
 
+    if (freshness === "stale") {
+      if (isFastLaneTicker) {
+        fastLaneRefreshes.push(ticker);
+      } else {
+        staleSlowLane.push(ticker);
+      }
+      continue;
+    }
+
     if (isFastLaneTicker && cacheAgeMs > fastLaneCacheTtlMs) {
       fastLaneRefreshes.push(ticker);
     } else if (slowLaneRotation.has(ticker) && cacheAgeMs > slowLaneCacheTtlMs) {
@@ -1276,7 +1289,7 @@ export async function fetchFinnhubQuotes(
     }
   }
 
-  const slowLaneRefreshPlan = [...missingSlowLane, ...rotatedSlowLaneRefreshes].slice(0, slowLaneBatchSize);
+  const slowLaneRefreshPlan = [...staleSlowLane, ...missingSlowLane, ...rotatedSlowLaneRefreshes].slice(0, slowLaneBatchSize);
   const tickersNeedingRefresh = Array.from(new Set([...fastLaneRefreshes, ...slowLaneRefreshPlan]));
 
   if (tickersNeedingRefresh.length) {

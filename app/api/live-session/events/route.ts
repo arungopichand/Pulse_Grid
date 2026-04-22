@@ -2,6 +2,15 @@ import { getLiveSessionSnapshot, subscribeToLiveSessionSnapshots } from "@/lib/l
 
 export const dynamic = "force-dynamic";
 
+function stripSignalDebug<T extends { signals: Array<Record<string, unknown>> }>(snapshot: T): T {
+  return {
+    ...snapshot,
+    signals: snapshot.signals.map((signal) =>
+      Object.fromEntries(Object.entries(signal).filter(([key]) => key !== "qualityDebug")),
+    ),
+  };
+}
+
 export async function GET(request: Request) {
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | null = null;
@@ -33,10 +42,10 @@ export async function GET(request: Request) {
       }, 15_000);
 
       const initialSnapshot = await getLiveSessionSnapshot();
-      sendEvent("snapshot", initialSnapshot);
+      sendEvent("snapshot", stripSignalDebug(initialSnapshot));
 
       unsubscribe = subscribeToLiveSessionSnapshots((snapshot) => {
-        sendEvent("snapshot", snapshot);
+        sendEvent("snapshot", stripSignalDebug(snapshot));
       });
     },
     cancel() {

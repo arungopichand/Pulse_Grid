@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { QuoteFetchResult, fetchFinnhubQuotes, getMarketDataThresholds, marketDataProvider } from "@/lib/market-data";
+import { QuoteFetchResult, getMarketDataThresholds, marketDataProvider } from "@/lib/market-data";
+import { getQuoteFetchResultFromStream, startMarketStream } from "@/lib/market-stream";
 
 export async function GET(request: NextRequest) {
+  await startMarketStream();
   const tickersParam = request.nextUrl.searchParams.get("tickers") ?? "";
   const tickers = Array.from(
     new Set(
@@ -41,11 +43,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(invalidRequest, { status: 400 });
   }
 
-  const result = await fetchFinnhubQuotes(tickers, {
-    prioritizedTickers: tickers,
-    fastLaneTickers: tickers,
-    slowLaneBatchSize: tickers.length,
-  });
+  const result = getQuoteFetchResultFromStream(tickers);
   const status = result.ok
     ? 200
     : result.reason === "invalid_request"

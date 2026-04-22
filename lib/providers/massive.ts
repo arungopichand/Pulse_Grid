@@ -102,6 +102,29 @@ function massiveTimestampToIso(timestamp: unknown) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function deriveChangePercent(rawTicker: MassiveSnapshotTicker, price: number | null) {
+  const directPercent = ensureFiniteNumber(rawTicker.todaysChangePerc);
+  if (directPercent !== null) {
+    return directPercent;
+  }
+
+  const todaysChange = ensureFiniteNumber(rawTicker.todaysChange);
+  if (price !== null && todaysChange !== null) {
+    const previousClose = price - todaysChange;
+    if (Math.abs(previousClose) > 0.000001) {
+      return (todaysChange / previousClose) * 100;
+    }
+  }
+
+  const dayClose = ensureFiniteNumber(rawTicker.day?.c);
+  const previousClose = ensureFiniteNumber(rawTicker.prevDay?.c);
+  if (dayClose !== null && previousClose !== null && Math.abs(previousClose) > 0.000001) {
+    return ((dayClose - previousClose) / previousClose) * 100;
+  }
+
+  return null;
+}
+
 function normalizeSnapshotTicker(rawTicker: MassiveSnapshotTicker): MassiveQuoteSnapshot | null {
   const ticker = typeof rawTicker.ticker === "string" ? rawTicker.ticker.trim().toUpperCase() : "";
   if (!ticker) {
@@ -116,12 +139,13 @@ function normalizeSnapshotTicker(rawTicker: MassiveSnapshotTicker): MassiveQuote
     massiveTimestampToIso(rawTicker.updated) ??
     massiveTimestampToIso(rawTicker.lastTrade?.t) ??
     massiveTimestampToIso(rawTicker.min?.t) ??
-    massiveTimestampToIso(rawTicker.day?.t);
-  const changePercent = ensureFiniteNumber(rawTicker.todaysChangePerc);
+    massiveTimestampToIso(rawTicker.day?.t) ??
+    new Date().toISOString();
+  const changePercent = deriveChangePercent(rawTicker, price);
   const currentVolume = ensureFiniteNumber(rawTicker.day?.v);
   const minuteVolume = ensureFiniteNumber(rawTicker.min?.v);
 
-  if (price === null || timestamp === null || changePercent === null) {
+  if (price === null || changePercent === null) {
     return null;
   }
 
