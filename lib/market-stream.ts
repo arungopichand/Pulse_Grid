@@ -1,6 +1,8 @@
 import { fetchMassiveStockSnapshots, getMassiveApiKey } from "./providers/massive";
 import { getDynamicMarketUniverse } from "./market-universe";
 import type { QuoteFetchResult, QuoteSnapshot, QuoteState, QuoteFetchSummary, QuoteFreshness } from "./market-data";
+import { consumeRateLimitToken } from "./request-rate-limiter";
+import { getSignalRuntimeConfig } from "./signal-runtime-config";
 import type { WatchlistTicker } from "./watchlist";
 import type { VolumeSnapshot } from "./volume-data";
 
@@ -32,68 +34,172 @@ type MarketStreamHealth = {
   streamStarted: boolean;
   uptimeMs: number;
   reconnectScheduled: boolean;
+  reconnecting: boolean;
+  inBootstrap: boolean;
+  rateBudgetLimited: boolean;
+  lastRateBudgetLimitedAt: string | null;
   stale: boolean;
   degraded: boolean;
+  wsMessagesReceived: number;
+  wsUpdatesApplied: number;
+  snapshotUpdatesApplied: number;
+  lastWsUpdateAt: string | null;
+  lastSnapshotUpdateAt: string | null;
+  wsMessageSamples: Array<{
+    messageType: string;
+    keys: string[];
+    updatesParsed: number;
+  }>;
+  statusOnlyStream: boolean;
 };
 
 type DynamicUniverseState = {
   symbols: WatchlistTicker[];
   lastRefreshedAt: number;
-  source: "live" | "cache" | "fallback_empty";
+  source: "live" | "cache" | "fallback_empty" | "fallback_default";
   reasonsBySymbol: Record<string, string>;
   topSymbols: string[];
   discoveredCount: number;
   selectedCount: number;
 };
 
+type MarketStreamManager = {
+  symbolState: Map<string, SymbolLiveState>;
+  messageTimestamps: number[];
+  subscribedSymbols: Set<string>;
+  dynamicUniverse: DynamicUniverseState;
+  streamSocket: WebSocket | null;
+  connectPromise: Promise<void> | null;
+  started: boolean;
+  streamState: StreamConnectionState;
+  reconnectCount: number;
+  reconnectAttempt: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  lastMessageAt: number;
+  lastBootstrapAt: number;
+  lastForcedDisconnectAt: number;
+  streamStartedAt: number;
+  inBootstrap: boolean;
+  healthInterval: ReturnType<typeof setInterval> | null;
+  universeInterval: ReturnType<typeof setInterval> | null;
+  bootstrapInterval: ReturnType<typeof setInterval> | null;
+  shutdownRegistered: boolean;
+  socketGeneration: number;
+  lastRateBudgetLimitedAt: number;
+  rateBudgetLimited: boolean;
+  wsMessagesReceived: number;
+  wsUpdatesApplied: number;
+  snapshotUpdatesApplied: number;
+  lastWsUpdateAt: number;
+  lastSnapshotUpdateAt: number;
+  isAuthenticated: boolean;
+  hasSubscribed: boolean;
+  wsMessageSamples: Array<{
+    messageType: string;
+    keys: string[];
+    updatesParsed: number;
+  }>;
+  lastStatusOnlyFallbackAt: number;
+};
+
 const WS_ENDPOINT = process.env.MASSIVE_WS_URL?.trim() || "wss://socket.massive.com/stocks";
-const STREAM_STALE_AFTER_MS = 20_000;
 const STREAM_HEALTH_INTERVAL_MS = 5_000;
-const UNIVERSE_REFRESH_MS = 60_000;
-const BOOTSTRAP_REFRESH_MS = 30_000;
+const DEFAULT_BOOTSTRAP_REFRESH_MS = 30_000;
 const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
-const UNIVERSE_CAP = 50;
+const CLOSE_CODE_NORMAL = 1000;
+const DEFAULT_FALLBACK_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "GOOG", "SPY", "QQQ"] as const;
 
-const symbolState = new Map<string, SymbolLiveState>();
-const messageTimestamps: number[] = [];
-const subscribedSymbols = new Set<string>();
+declare global {
+  var __pulseGridMarketStreamManager__: MarketStreamManager | undefined;
+}
 
-let streamSocket: WebSocket | null = null;
-let started = false;
-let streamState: StreamConnectionState = "idle";
-let reconnectCount = 0;
-let reconnectAttempt = 0;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let lastMessageAt = 0;
-let lastBootstrapAt = 0;
-let lastForcedDisconnectAt = 0;
-let streamStartedAt = 0;
-let inBootstrap = false;
-let dynamicUniverse: DynamicUniverseState = {
-  symbols: [],
-  lastRefreshedAt: 0,
-  source: "fallback_empty",
-  reasonsBySymbol: {},
-  topSymbols: [],
-  discoveredCount: 0,
-  selectedCount: 0,
-};
+function createManager(): MarketStreamManager {
+  return {
+    symbolState: new Map(),
+    messageTimestamps: [],
+    subscribedSymbols: new Set(),
+    dynamicUniverse: {
+      symbols: [],
+      lastRefreshedAt: 0,
+      source: "fallback_empty",
+      reasonsBySymbol: {},
+      topSymbols: [],
+      discoveredCount: 0,
+      selectedCount: 0,
+    },
+    streamSocket: null,
+    connectPromise: null,
+    started: false,
+    streamState: "idle",
+    reconnectCount: 0,
+    reconnectAttempt: 0,
+    reconnectTimer: null,
+    lastMessageAt: 0,
+    lastBootstrapAt: 0,
+    lastForcedDisconnectAt: 0,
+    streamStartedAt: 0,
+    inBootstrap: false,
+    healthInterval: null,
+    universeInterval: null,
+    bootstrapInterval: null,
+    shutdownRegistered: false,
+    socketGeneration: 0,
+    lastRateBudgetLimitedAt: 0,
+    rateBudgetLimited: false,
+    wsMessagesReceived: 0,
+    wsUpdatesApplied: 0,
+    snapshotUpdatesApplied: 0,
+    lastWsUpdateAt: 0,
+    lastSnapshotUpdateAt: 0,
+    isAuthenticated: false,
+    hasSubscribed: false,
+    wsMessageSamples: [],
+    lastStatusOnlyFallbackAt: 0,
+  };
+}
+
+const manager = globalThis.__pulseGridMarketStreamManager__ ?? createManager();
+globalThis.__pulseGridMarketStreamManager__ = manager;
 
 function nowIso() {
   return new Date().toISOString();
 }
 
+function toFallbackTicker(symbol: string): WatchlistTicker {
+  return {
+    ticker: symbol,
+    company: symbol,
+    sector: "Fallback",
+    exchange: "UNKNOWN",
+    instrumentType: "Common Stock",
+    country: "US",
+    floatShares: null,
+  };
+}
+
+function log(event: string, details?: Record<string, unknown>) {
+  console.log("[market-stream]", event, {
+    ts: nowIso(),
+    status: manager.streamState,
+    socketGeneration: manager.socketGeneration,
+    subscribedSymbolCount: manager.subscribedSymbols.size,
+    reconnectAttempt: manager.reconnectAttempt,
+    reconnectScheduled: manager.reconnectTimer !== null,
+    ...(details ?? {}),
+  });
+}
+
 function cleanupOldMessageTimestamps(now = Date.now()) {
-  while (messageTimestamps.length > 0 && now - messageTimestamps[0] > 60_000) {
-    messageTimestamps.shift();
+  while (manager.messageTimestamps.length > 0 && now - manager.messageTimestamps[0] > 60_000) {
+    manager.messageTimestamps.shift();
   }
 }
 
 function markMessageReceived() {
   const now = Date.now();
-  lastMessageAt = now;
-  messageTimestamps.push(now);
+  manager.lastMessageAt = now;
+  manager.messageTimestamps.push(now);
   cleanupOldMessageTimestamps(now);
 }
 
@@ -108,18 +214,19 @@ function updateSymbolState(partial: {
   timestamp?: string | null;
   currentVolume?: number | null;
   averageVolume?: number | null;
+  source?: "ws" | "snapshot";
 }) {
   const ticker = partial.ticker.trim().toUpperCase();
   if (!ticker) return;
 
-  const existing = symbolState.get(ticker);
+  const existing = manager.symbolState.get(ticker);
   const price = partial.price ?? existing?.price ?? null;
   const changePercent = partial.changePercent ?? existing?.changePercent ?? null;
   if (price === null || changePercent === null) {
     return;
   }
 
-  symbolState.set(ticker, {
+  manager.symbolState.set(ticker, {
     ticker,
     price,
     changePercent,
@@ -130,6 +237,13 @@ function updateSymbolState(partial: {
       partial.averageVolume !== undefined ? partial.averageVolume : existing?.averageVolume ?? null,
     provider: "massive",
   });
+  if (partial.source === "ws") {
+    manager.wsUpdatesApplied += 1;
+    manager.lastWsUpdateAt = Date.now();
+  } else {
+    manager.snapshotUpdatesApplied += 1;
+    manager.lastSnapshotUpdateAt = Date.now();
+  }
 }
 
 function parsePotentialTickUpdate(payload: unknown): Array<{
@@ -152,14 +266,18 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
   for (const row of rows) {
     if (!row || typeof row !== "object") continue;
     const entry = row as Record<string, unknown>;
-    const tickerRaw = entry.sym ?? entry.symbol ?? entry.ticker;
+    const tickerRaw = entry.sym ?? entry.symbol ?? entry.ticker ?? entry.S;
     const ticker = typeof tickerRaw === "string" ? tickerRaw.trim().toUpperCase() : "";
     if (!ticker) continue;
 
-    const price = parseNumber(entry.p) ?? parseNumber(entry.price) ?? parseNumber(entry.c);
+    const price =
+      parseNumber(entry.p) ??
+      parseNumber(entry.price) ??
+      parseNumber(entry.c) ??
+      parseNumber(entry.close);
     const changePercent = parseNumber(entry.dp) ?? parseNumber(entry.changePercent) ?? parseNumber(entry.todaysChangePerc);
     const currentVolume = parseNumber(entry.v) ?? parseNumber(entry.volume) ?? parseNumber(entry.dayVolume);
-    const timestampRaw = parseNumber(entry.t) ?? parseNumber(entry.timestamp);
+    const timestampRaw = parseNumber(entry.t) ?? parseNumber(entry.e) ?? parseNumber(entry.timestamp);
     const timestamp =
       timestampRaw !== null
         ? new Date(timestampRaw > 9_999_999_999_999 ? Math.floor(timestampRaw / 1_000_000) : timestampRaw).toISOString()
@@ -177,139 +295,352 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
   return updates;
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectCount += 1;
-  reconnectAttempt += 1;
-  const backoff = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** Math.max(0, reconnectAttempt - 1));
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connectSocket();
-  }, backoff);
-}
-
-function closeSocket() {
-  if (!streamSocket) return;
-  try {
-    streamSocket.close();
-  } catch {
-    // ignore
-  }
-  streamSocket = null;
+function captureWsMessageSample(parsed: unknown, updatesParsed: number) {
+  if (manager.wsMessageSamples.length >= 12) return;
+  const first = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!first || typeof first !== "object") return;
+  const entry = first as Record<string, unknown>;
+  const keys = Object.keys(entry).slice(0, 12);
+  const messageType =
+    (typeof entry.ev === "string" && entry.ev) ||
+    (typeof entry.event === "string" && entry.event) ||
+    (typeof entry.status === "string" && `status:${entry.status}`) ||
+    "unknown";
+  manager.wsMessageSamples.push({
+    messageType,
+    keys,
+    updatesParsed,
+  });
 }
 
 function buildSubscribePayload() {
-  const symbols = [...subscribedSymbols];
+  const symbols = [...manager.subscribedSymbols];
   if (!symbols.length) return null;
-  // Massive socket payloads differ by account tier; send broad-compatible shapes.
-  return [
-    { action: "subscribe", params: symbols.map((ticker) => `T.${ticker}`).join(",") },
-    { action: "subscribe", symbols },
-  ];
+  return {
+    action: "subscribe",
+    params: symbols.map((ticker) => `T.${ticker}`).join(","),
+  };
 }
 
-function sendAuthAndSubscribe() {
-  if (!streamSocket || streamSocket.readyState !== WebSocket.OPEN) return;
+function sendAuth(socket = manager.streamSocket) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const key = getMassiveApiKey();
   if (!key) return;
-  const payloads = [
-    { action: "auth", params: key },
-    { action: "authenticate", apiKey: key },
-  ];
-  for (const payload of payloads) {
-    try {
-      streamSocket.send(JSON.stringify(payload));
-    } catch {
-      // ignore
-    }
+  try {
+    socket.send(JSON.stringify({ action: "auth", params: key }));
+  } catch (error) {
+    log("send_auth_failed", { error: error instanceof Error ? error.message : String(error) });
   }
 
-  const subscribePayloads = buildSubscribePayload();
-  if (!subscribePayloads) return;
-  for (const payload of subscribePayloads) {
-    try {
-      streamSocket.send(JSON.stringify(payload));
-    } catch {
-      // ignore
-    }
+}
+
+function sendSubscribe(socket = manager.streamSocket) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const subscribePayload = buildSubscribePayload();
+  if (!subscribePayload) return;
+
+  try {
+    socket.send(JSON.stringify(subscribePayload));
+    manager.hasSubscribed = true;
+    console.log("[massive-ws] subscribed symbols count:", manager.subscribedSymbols.size);
+  } catch (error) {
+    log("send_subscribe_failed", { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-async function connectSocket() {
-  if (streamSocket || streamState === "connecting") return;
-  const key = getMassiveApiKey();
-  if (!key) {
-    streamState = "degraded";
+function payloadHasAuthSuccess(payload: unknown) {
+  const rows = Array.isArray(payload) ? payload : [payload];
+  return rows.some((row) => {
+    if (!row || typeof row !== "object") return false;
+    const entry = row as Record<string, unknown>;
+    const status = typeof entry.status === "string" ? entry.status.toLowerCase() : "";
+    const message = typeof entry.message === "string" ? entry.message.toLowerCase() : "";
+    return status === "auth_success" || message.includes("authenticated");
+  });
+}
+
+function clearReconnectTimer() {
+  if (!manager.reconnectTimer) return;
+  clearTimeout(manager.reconnectTimer);
+  manager.reconnectTimer = null;
+}
+
+function scheduleReconnect(reason: string) {
+  if (!manager.started) return;
+  if (manager.reconnectTimer) {
+    log("reconnect_already_scheduled", { reason });
     return;
   }
 
-  streamState = "connecting";
+  manager.reconnectCount += 1;
+  manager.reconnectAttempt += 1;
+  console.log("[massive-ws] reconnecting");
+  const backoff = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** Math.max(0, manager.reconnectAttempt - 1));
+  log("reconnect_start", { reason, attempt: manager.reconnectAttempt, backoffMs: backoff });
+  log("reconnect_scheduled", { reason, backoffMs: backoff });
+  manager.reconnectTimer = setTimeout(() => {
+    manager.reconnectTimer = null;
+    void connectSocket("scheduled_reconnect");
+  }, backoff);
+}
+
+function clearSocketReference(socket: WebSocket) {
+  if (manager.streamSocket === socket) {
+    manager.streamSocket = null;
+  }
+}
+
+function closeSocketInternal(reason: string, options?: { socket?: WebSocket; suppressReconnect?: boolean }) {
+  const socket = options?.socket ?? manager.streamSocket;
+  if (!socket) return;
+
+  clearSocketReference(socket);
   try {
-    streamSocket = new WebSocket(WS_ENDPOINT);
-  } catch {
-    streamState = "degraded";
-    streamSocket = null;
-    scheduleReconnect();
-    return;
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close(CLOSE_CODE_NORMAL, reason.slice(0, 120));
+    }
+  } catch (error) {
+    log("close_failed", { reason, error: error instanceof Error ? error.message : String(error) });
   }
 
-  streamSocket.addEventListener("open", () => {
-    streamState = "connected";
-    reconnectAttempt = 0;
-    sendAuthAndSubscribe();
-  });
+  manager.streamState = options?.suppressReconnect ? "disconnected" : manager.streamState;
+  log("socket_closed", { reason, suppressReconnect: options?.suppressReconnect ?? false });
+}
 
-  streamSocket.addEventListener("message", (event) => {
-    markMessageReceived();
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(String(event.data));
-    } catch {
-      return;
-    }
-    const updates = parsePotentialTickUpdate(parsed);
-    for (const update of updates) {
-      updateSymbolState(update);
-    }
-  });
+function registerShutdownHandlers() {
+  if (manager.shutdownRegistered) return;
+  manager.shutdownRegistered = true;
 
-  const onDisconnect = () => {
-    closeSocket();
-    streamState = "disconnected";
-    scheduleReconnect();
+  const shutdown = (signal: string) => {
+    log("shutdown", { signal });
+    clearReconnectTimer();
+    closeSocketInternal(`shutdown:${signal}`, { suppressReconnect: true });
   };
 
-  streamSocket.addEventListener("error", onDisconnect);
-  streamSocket.addEventListener("close", onDisconnect);
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("beforeExit", () => shutdown("beforeExit"));
+}
+
+async function connectSocket(reason: string) {
+  if (manager.connectPromise) {
+    log("connect_joined", { reason });
+    return manager.connectPromise;
+  }
+
+  if (manager.streamSocket && (manager.streamSocket.readyState === WebSocket.OPEN || manager.streamSocket.readyState === WebSocket.CONNECTING)) {
+    log("connect_skipped_existing_socket", { reason, readyState: manager.streamSocket.readyState });
+    return;
+  }
+
+  const key = getMassiveApiKey();
+  console.log("[massive] api key configured:", Boolean(key));
+  if (!key) {
+    manager.streamState = "degraded";
+    log("connect_blocked_missing_api_key", { reason });
+    return;
+  }
+
+  manager.connectPromise = (async () => {
+    manager.streamState = "connecting";
+    console.log("[massive-ws] connecting");
+    clearReconnectTimer();
+    const generation = manager.socketGeneration + 1;
+    manager.socketGeneration = generation;
+
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(WS_ENDPOINT);
+    } catch (error) {
+      manager.streamState = "degraded";
+      manager.streamSocket = null;
+      log("connect_constructor_failed", { reason, error: error instanceof Error ? error.message : String(error) });
+      scheduleReconnect("constructor_failed");
+      return;
+    }
+
+    manager.streamSocket = socket;
+    log("connect_opening", { reason, generation });
+
+    socket.addEventListener("open", () => {
+      if (manager.streamSocket !== socket) {
+        log("socket_open_ignored_stale", { generation });
+        closeSocketInternal("stale_open_socket", { socket, suppressReconnect: true });
+        return;
+      }
+
+      const wasReconnecting = manager.reconnectAttempt > 0;
+      manager.streamState = "connected";
+      console.log("[massive-ws] connected");
+      manager.isAuthenticated = false;
+      manager.hasSubscribed = false;
+      manager.reconnectAttempt = 0;
+      log("socket_open", { generation });
+      if (wasReconnecting) {
+        log("reconnect_end", { generation });
+      }
+      sendAuth(socket);
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (manager.streamSocket !== socket) {
+        return;
+      }
+
+      markMessageReceived();
+      manager.wsMessagesReceived += 1;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (!manager.isAuthenticated && payloadHasAuthSuccess(parsed)) {
+        manager.isAuthenticated = true;
+        log("socket_authenticated", { generation });
+        console.log("[massive-ws] authenticated");
+        sendSubscribe(socket);
+      }
+
+      const updates = parsePotentialTickUpdate(parsed);
+      console.log("[massive-ws] message received");
+      captureWsMessageSample(parsed, updates.length);
+      for (const update of updates) {
+        updateSymbolState({
+          ...update,
+          source: "ws",
+        });
+      }
+    });
+
+    const onDisconnect = (eventType: "error" | "close", event?: Event) => {
+      const wasActiveSocket = manager.streamSocket === socket;
+      clearSocketReference(socket);
+
+      if (!wasActiveSocket) {
+        log("socket_disconnect_ignored_stale", { generation, eventType });
+        return;
+      }
+
+      manager.streamState = "disconnected";
+      manager.isAuthenticated = false;
+      manager.hasSubscribed = false;
+      console.log("[massive-ws] disconnected");
+      log("socket_disconnect", {
+        generation,
+        eventType,
+        code: event && "code" in event ? (event as CloseEvent).code : undefined,
+        reason: event && "reason" in event ? (event as CloseEvent).reason : undefined,
+      });
+      scheduleReconnect(eventType);
+    };
+
+    socket.addEventListener("error", (event) => {
+      onDisconnect("error", event);
+    });
+    socket.addEventListener("close", (event) => {
+      onDisconnect("close", event);
+    });
+  })().finally(() => {
+    manager.connectPromise = null;
+  });
+
+  return manager.connectPromise;
 }
 
 async function refreshUniverse() {
+  const runtimeConfig = getSignalRuntimeConfig();
+  const budget = consumeRateLimitToken("massive_rest:universe", runtimeConfig.maxApiCallsPerMinute, 60_000);
+  if (!budget.allowed) {
+    manager.lastRateBudgetLimitedAt = Date.now();
+    if (!manager.rateBudgetLimited) {
+      manager.rateBudgetLimited = true;
+      log("rate_budget_limited_entered", { source: "universe_refresh" });
+    }
+    log("universe_refresh_skipped_rate_budget", {
+      retryAfterMs: budget.retryAfterMs,
+      maxApiCallsPerMinute: runtimeConfig.maxApiCallsPerMinute,
+    });
+    return;
+  }
+  if (manager.rateBudgetLimited) {
+    manager.rateBudgetLimited = false;
+    log("rate_budget_limited_exited", { source: "universe_refresh" });
+  }
+
   const discovered = await getDynamicMarketUniverse({
-    cap: UNIVERSE_CAP,
+    cap: runtimeConfig.maxSymbolsPerScan,
   });
-  dynamicUniverse = {
-    symbols: discovered.candidates,
+  const fallbackCandidates = DEFAULT_FALLBACK_SYMBOLS.map((symbol) => toFallbackTicker(symbol));
+  const useFallbackDefault = discovered.candidates.length === 0;
+  const candidates = useFallbackDefault ? fallbackCandidates : discovered.candidates;
+  const source = useFallbackDefault ? "fallback_default" : discovered.source;
+  const reasonsBySymbol = useFallbackDefault
+    ? Object.fromEntries(DEFAULT_FALLBACK_SYMBOLS.map((symbol) => [symbol, "fallback_default_watchlist"]))
+    : discovered.reasonsBySymbol;
+  const topSymbols = useFallbackDefault
+    ? DEFAULT_FALLBACK_SYMBOLS.slice(0, Math.min(DEFAULT_FALLBACK_SYMBOLS.length, runtimeConfig.maxSymbolsPerScan))
+    : discovered.topSymbols;
+
+  manager.dynamicUniverse = {
+    symbols: candidates,
     lastRefreshedAt: Date.now(),
-    source: discovered.source,
-    reasonsBySymbol: discovered.reasonsBySymbol,
-    topSymbols: discovered.topSymbols,
+    source,
+    reasonsBySymbol,
+    topSymbols,
     discoveredCount: discovered.discoveredCount,
-    selectedCount: discovered.selectedCount,
+    selectedCount: candidates.length,
   };
 
-  subscribedSymbols.clear();
-  for (const symbol of discovered.candidates) {
-    subscribedSymbols.add(symbol.ticker);
+  manager.subscribedSymbols.clear();
+  for (const symbol of candidates) {
+    manager.subscribedSymbols.add(symbol.ticker);
   }
-  sendAuthAndSubscribe();
+
+  log("universe_refreshed", {
+    discoveredCount: discovered.discoveredCount,
+    selectedCount: candidates.length,
+    source,
+  });
+  if (manager.streamSocket?.readyState === WebSocket.OPEN) {
+    if (manager.isAuthenticated) {
+      sendSubscribe();
+    } else {
+      sendAuth();
+    }
+  }
 }
 
 async function bootstrapQuotes() {
-  if (inBootstrap) return;
-  if (subscribedSymbols.size === 0) return;
-  inBootstrap = true;
+  if (manager.inBootstrap) return;
+  if (manager.subscribedSymbols.size === 0) return;
+  const runtimeConfig = getSignalRuntimeConfig();
+  const budget = consumeRateLimitToken("massive_rest:bootstrap", runtimeConfig.maxApiCallsPerMinute, 60_000);
+  if (!budget.allowed) {
+    manager.lastRateBudgetLimitedAt = Date.now();
+    if (!manager.rateBudgetLimited) {
+      manager.rateBudgetLimited = true;
+      log("rate_budget_limited_entered", { source: "bootstrap" });
+    }
+    log("bootstrap_skipped_rate_budget", {
+      retryAfterMs: budget.retryAfterMs,
+      maxApiCallsPerMinute: runtimeConfig.maxApiCallsPerMinute,
+    });
+    return;
+  }
+  if (manager.rateBudgetLimited) {
+    manager.rateBudgetLimited = false;
+    log("rate_budget_limited_exited", { source: "bootstrap" });
+  }
+  manager.inBootstrap = true;
+  log("bootstrap_start", { symbolCount: manager.subscribedSymbols.size });
+
   try {
-    const response = await fetchMassiveStockSnapshots([...subscribedSymbols]);
+    const response = await fetchMassiveStockSnapshots([...manager.subscribedSymbols]);
+    log("massive_snapshot_request", {
+      endpoint: "snapshot_tickers",
+      symbolCount: manager.subscribedSymbols.size,
+    });
     const payload = response.payload as { tickers?: Array<Record<string, unknown>> };
     if (!Array.isArray(payload.tickers)) return;
 
@@ -330,62 +661,117 @@ async function bootstrapQuotes() {
         currentVolume: dayVolume,
         averageVolume,
         timestamp: nowIso(),
+        source: "snapshot",
       });
     }
-    lastBootstrapAt = Date.now();
-  } catch {
-    streamState = streamState === "connected" ? "connected" : "degraded";
+
+    manager.lastBootstrapAt = Date.now();
+  } catch (error) {
+    manager.streamState = manager.streamState === "connected" ? "connected" : "degraded";
+    log("bootstrap_failed", { error: error instanceof Error ? error.message : String(error) });
   } finally {
-    inBootstrap = false;
+    manager.inBootstrap = false;
+    log("bootstrap_end", {
+      symbolCount: manager.subscribedSymbols.size,
+      lastBootstrapAt: manager.lastBootstrapAt ? new Date(manager.lastBootstrapAt).toISOString() : null,
+    });
   }
 }
 
 function monitorStreamHealth() {
+  const runtimeConfig = getSignalRuntimeConfig();
+  const staleAfterMs = runtimeConfig.staleTickThresholdMs;
   const now = Date.now();
   cleanupOldMessageTimestamps(now);
-  if (streamState === "connected" && lastMessageAt > 0 && now - lastMessageAt > STREAM_STALE_AFTER_MS) {
-    streamState = "degraded";
-    closeSocket();
-    scheduleReconnect();
+  if (manager.streamState === "connected" && manager.lastMessageAt > 0 && now - manager.lastMessageAt > staleAfterMs) {
+    manager.streamState = "degraded";
+    log("stream_stale", { staleForMs: now - manager.lastMessageAt });
+    closeSocketInternal("stream_stale");
+    scheduleReconnect("stream_stale");
+  }
+  const statusOnlyStream = manager.wsMessagesReceived > 0 && manager.wsUpdatesApplied === 0;
+  if (
+    manager.streamState === "connected" &&
+    statusOnlyStream &&
+    now - manager.lastBootstrapAt > Math.max(4_000, runtimeConfig.scanIntervalMs * 2)
+  ) {
+    if (now - manager.lastStatusOnlyFallbackAt > 60_000) {
+      manager.lastStatusOnlyFallbackAt = now;
+      log("status_only_stream_refresh_fallback");
+    }
+    void bootstrapQuotes().catch((error) => {
+      log("status_only_stream_refresh_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+}
+
+function ensureIntervals() {
+  const runtimeConfig = getSignalRuntimeConfig();
+  if (!manager.universeInterval) {
+    manager.universeInterval = setInterval(() => {
+      void refreshUniverse().catch((error) => {
+        log("universe_refresh_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, runtimeConfig.universeRefreshMs);
+  }
+
+  if (!manager.bootstrapInterval) {
+    const bootstrapRefreshMs = Math.max(5_000, Math.min(DEFAULT_BOOTSTRAP_REFRESH_MS, runtimeConfig.scanIntervalMs * 6));
+    manager.bootstrapInterval = setInterval(() => {
+      void bootstrapQuotes().catch((error) => {
+        log("bootstrap_refresh_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, bootstrapRefreshMs);
+  }
+
+  if (!manager.healthInterval) {
+    manager.healthInterval = setInterval(() => {
+      monitorStreamHealth();
+    }, STREAM_HEALTH_INTERVAL_MS);
   }
 }
 
 export async function startMarketStream() {
-  if (started) return;
-  started = true;
-  streamStartedAt = Date.now();
+  registerShutdownHandlers();
+
+  if (manager.started) {
+    await connectSocket("start_reuse");
+    return;
+  }
+
+  manager.started = true;
+  manager.streamStartedAt = Date.now();
+  log("stream_start");
 
   try {
     await refreshUniverse();
     await bootstrapQuotes();
-  } catch {
-    // keep degraded fallback, timers still run.
+  } catch (error) {
+    log("stream_bootstrap_phase_failed", { error: error instanceof Error ? error.message : String(error) });
   }
 
-  await connectSocket();
-
-  setInterval(() => {
-    void refreshUniverse();
-  }, UNIVERSE_REFRESH_MS);
-
-  setInterval(() => {
-    void bootstrapQuotes();
-  }, BOOTSTRAP_REFRESH_MS);
-
-  setInterval(() => {
-    monitorStreamHealth();
-  }, STREAM_HEALTH_INTERVAL_MS);
+  ensureIntervals();
+  await connectSocket("initial_start");
 }
 
 function freshnessFromTimestamp(timestamp: string): QuoteFreshness {
+  const runtimeConfig = getSignalRuntimeConfig();
+  const staleAfterMs = runtimeConfig.staleTickThresholdMs;
+  const freshAfterMs = Math.max(5_000, Math.round(staleAfterMs / 3));
   const ageMs = Math.max(0, Date.now() - new Date(timestamp).getTime());
-  if (ageMs <= 20_000) return "fresh";
-  if (ageMs <= 60_000) return "cached";
+  if (ageMs <= freshAfterMs) return "fresh";
+  if (ageMs <= staleAfterMs) return "cached";
   return "stale";
 }
 
 export function getSymbolSnapshot(symbol: string): QuoteSnapshot | null {
-  const entry = symbolState.get(symbol.trim().toUpperCase());
+  const entry = manager.symbolState.get(symbol.trim().toUpperCase());
   if (!entry) return null;
   return {
     ticker: entry.ticker,
@@ -399,7 +785,10 @@ export function getSymbolSnapshot(symbol: string): QuoteSnapshot | null {
 }
 
 export function getMarketSnapshot(tickers?: string[]) {
-  const selected = tickers && tickers.length > 0 ? tickers : [...subscribedSymbols];
+  const runtimeConfig = getSignalRuntimeConfig();
+  const staleAfterMs = runtimeConfig.staleTickThresholdMs;
+  const cacheTtlMs = Math.max(5_000, Math.round(staleAfterMs / 3));
+  const selected = tickers && tickers.length > 0 ? tickers : [...manager.subscribedSymbols];
   const quotes = selected
     .map((ticker) => getSymbolSnapshot(ticker))
     .filter((quote): quote is QuoteSnapshot => Boolean(quote));
@@ -452,28 +841,28 @@ export function getMarketSnapshot(tickers?: string[]) {
     quotes,
     summary,
     quoteStates,
-    cacheTtlMs: 20_000,
-    staleAfterMs: 60_000,
+    cacheTtlMs,
+    staleAfterMs,
     refreshBatchSize: Math.min(10, Math.max(1, selected.length)),
-    degraded: streamState !== "connected" && streamState !== "connecting",
+    degraded: manager.streamState !== "connected" && manager.streamState !== "connecting",
   };
 }
 
 export function getDynamicUniverse() {
   return {
-    symbols: dynamicUniverse.symbols,
-    source: dynamicUniverse.source,
-    reasonsBySymbol: dynamicUniverse.reasonsBySymbol,
-    topSymbols: dynamicUniverse.topSymbols,
-    discoveredCount: dynamicUniverse.discoveredCount,
-    selectedCount: dynamicUniverse.selectedCount,
+    symbols: manager.dynamicUniverse.symbols,
+    source: manager.dynamicUniverse.source,
+    reasonsBySymbol: manager.dynamicUniverse.reasonsBySymbol,
+    topSymbols: manager.dynamicUniverse.topSymbols,
+    discoveredCount: manager.dynamicUniverse.discoveredCount,
+    selectedCount: manager.dynamicUniverse.selectedCount,
   };
 }
 
 export function getVolumeSnapshotsForSymbols(tickers: string[]): VolumeSnapshot[] {
   const snapshots: VolumeSnapshot[] = [];
   for (const ticker of tickers) {
-    const entry = symbolState.get(ticker.trim().toUpperCase());
+    const entry = manager.symbolState.get(ticker.trim().toUpperCase());
     if (!entry) continue;
     if (entry.currentVolume === null) continue;
     const averageVolume = entry.averageVolume ?? null;
@@ -494,35 +883,61 @@ export function getVolumeSnapshotsForSymbols(tickers: string[]): VolumeSnapshot[
 }
 
 export function getMarketStreamHealth(): MarketStreamHealth {
+  const runtimeConfig = getSignalRuntimeConfig();
+  const staleAfterMs = runtimeConfig.staleTickThresholdMs;
   const now = Date.now();
   cleanupOldMessageTimestamps(now);
-  const stale = lastMessageAt > 0 ? now - lastMessageAt > STREAM_STALE_AFTER_MS : started && streamState !== "connecting";
-  const degraded = streamState === "degraded" || streamState === "disconnected" || (streamState === "connected" && stale);
+  const stale =
+    manager.lastMessageAt > 0
+      ? now - manager.lastMessageAt > staleAfterMs
+      : manager.started && manager.streamState !== "connecting";
+  const degraded =
+    manager.streamState === "degraded" ||
+    manager.streamState === "disconnected" ||
+    (manager.streamState === "connected" && stale);
   const mode: MarketStreamHealth["mode"] =
-    streamState === "connected" && !stale
+    manager.streamState === "connected" && !stale
       ? "realtime"
-      : streamState !== "idle" && symbolState.size > 0
+      : manager.streamState !== "idle" && manager.symbolState.size > 0
         ? "delayed"
         : "unknown";
+  const rateBudgetLimited =
+    manager.rateBudgetLimited ||
+    (manager.lastRateBudgetLimitedAt > 0 && now - manager.lastRateBudgetLimitedAt <= 60_000);
+  const reconnecting =
+    manager.streamState === "connecting" ||
+    manager.streamState === "disconnected" ||
+    manager.reconnectTimer !== null;
 
   return {
-    status: streamState,
-    connected: streamState === "connected",
-    realtime: streamState === "connected" && !stale,
+    status: manager.streamState,
+    connected: manager.streamState === "connected",
+    realtime: manager.streamState === "connected" && !stale,
     mode,
-    lastMessageAt: lastMessageAt ? new Date(lastMessageAt).toISOString() : null,
-    lastBootstrapAt: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null,
-    lastForcedDisconnectAt: lastForcedDisconnectAt ? new Date(lastForcedDisconnectAt).toISOString() : null,
-    subscribedSymbolCount: subscribedSymbols.size,
-    activeUniverseSize: dynamicUniverse.symbols.length,
-    snapshotSymbolCount: symbolState.size,
-    messagesPerMinute: messageTimestamps.length,
-    reconnectCount,
-    streamStarted: started,
-    uptimeMs: streamStartedAt ? Math.max(0, now - streamStartedAt) : 0,
-    reconnectScheduled: reconnectTimer !== null,
+    lastMessageAt: manager.lastMessageAt ? new Date(manager.lastMessageAt).toISOString() : null,
+    lastBootstrapAt: manager.lastBootstrapAt ? new Date(manager.lastBootstrapAt).toISOString() : null,
+    lastForcedDisconnectAt: manager.lastForcedDisconnectAt ? new Date(manager.lastForcedDisconnectAt).toISOString() : null,
+    subscribedSymbolCount: manager.subscribedSymbols.size,
+    activeUniverseSize: manager.dynamicUniverse.symbols.length,
+    snapshotSymbolCount: manager.symbolState.size,
+    messagesPerMinute: manager.messageTimestamps.length,
+    reconnectCount: manager.reconnectCount,
+    streamStarted: manager.started,
+    uptimeMs: manager.streamStartedAt ? Math.max(0, now - manager.streamStartedAt) : 0,
+    reconnectScheduled: manager.reconnectTimer !== null,
+    reconnecting,
+    inBootstrap: manager.inBootstrap,
+    rateBudgetLimited,
+    lastRateBudgetLimitedAt: manager.lastRateBudgetLimitedAt ? new Date(manager.lastRateBudgetLimitedAt).toISOString() : null,
     stale,
     degraded,
+    wsMessagesReceived: manager.wsMessagesReceived,
+    wsUpdatesApplied: manager.wsUpdatesApplied,
+    snapshotUpdatesApplied: manager.snapshotUpdatesApplied,
+    lastWsUpdateAt: manager.lastWsUpdateAt ? new Date(manager.lastWsUpdateAt).toISOString() : null,
+    lastSnapshotUpdateAt: manager.lastSnapshotUpdateAt ? new Date(manager.lastSnapshotUpdateAt).toISOString() : null,
+    wsMessageSamples: [...manager.wsMessageSamples],
+    statusOnlyStream: manager.wsMessagesReceived > 0 && manager.wsUpdatesApplied === 0,
   };
 }
 
@@ -535,7 +950,7 @@ export function forceMarketStreamReconnectForDebug() {
     } as const;
   }
 
-  if (!started) {
+  if (!manager.started) {
     return {
       ok: false,
       reason: "stream_not_started",
@@ -543,10 +958,10 @@ export function forceMarketStreamReconnectForDebug() {
     } as const;
   }
 
-  lastForcedDisconnectAt = Date.now();
-  streamState = "disconnected";
-  closeSocket();
-  scheduleReconnect();
+  manager.lastForcedDisconnectAt = Date.now();
+  manager.streamState = "disconnected";
+  closeSocketInternal("debug_reconnect");
+  scheduleReconnect("debug_reconnect");
 
   return {
     ok: true,

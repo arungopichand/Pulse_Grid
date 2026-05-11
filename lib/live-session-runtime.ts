@@ -1,4 +1,11 @@
-import { createLiveSignalEngineState, evaluateLiveSignals, type Signal } from "./live-signal-engine";
+import { buildLiveAlertsNow } from "./active-now";
+import { buildBotFeed } from "./bot-feed/normalize";
+import {
+  createLiveSignalEngineState,
+  evaluateLiveSignals,
+  getLiveSignalEngineCycleDiagnostics,
+  type Signal,
+} from "./live-signal-engine";
 import { type LiveSessionSnapshot, type QuoteSnapshot, type QuoteState } from "./market-data";
 import { getMarketClock } from "./market-session";
 import { computeVolumeMovers, type VolumeMover } from "./volume-movers";
@@ -6,6 +13,7 @@ import type { VolumeSnapshot } from "./volume-data";
 import { fetchStructuredNewsSnapshots, type StructuredNewsSnapshot } from "./news-data";
 import { buildLiveEvents, type LiveEvent } from "./live-events";
 import { loadPersistedSessionState, savePersistedSessionState, type PersistedSessionState, type PersistenceStatus, type PersistedSymbolHealth, type SymbolHealthOutcome } from "./session-state-store";
+import { getSignalRuntimeConfig } from "./signal-runtime-config";
 import {
   getDynamicUniverse as getDynamicUniverseFromStream,
   getMarketSnapshot,
@@ -15,13 +23,7 @@ import {
 } from "./market-stream";
 import type { WatchlistTicker } from "./watchlist";
 
-const LIVE_SESSION_FAST_INTERVAL_MS = 2_000;
-const LIVE_SESSION_IDLE_INTERVAL_MS = 5_000;
-const LIVE_SESSION_ACTIVE_DEMAND_WINDOW_MS = 60_000;
 const LIVE_SESSION_FAST_LANE_VOLUME_COUNT = 4;
-const DYNAMIC_UNIVERSE_TARGET_SIZE = 50;
-const UNIVERSE_REFRESH_INTERVAL_MS = 60_000;
-const NEWS_REFRESH_INTERVAL_MS = 90_000;
 const SYMBOL_HEALTH_WINDOW = 6;
 const SYMBOL_COLD_DURATION_MS = 12 * 60_000;
 const SYMBOL_SELECTION_STICKINESS_MS = 8 * 60_000;
@@ -44,6 +46,26 @@ type SharedLiveStateStore = {
   sessionLabel: string | null;
   lastCompletedAt: string | null;
   lastCycleLatencyMs: number | null;
+  lastEngineDiagnostics: {
+    evaluatedSymbols: number;
+    candidateSignals: number;
+    emittedSignals: number;
+    topRejected: Array<{
+      ticker: string;
+      reason: string;
+      changePercent: number | null;
+      freshness: string;
+    }>;
+    sampleSnapshots: Array<{
+      ticker: string;
+      lastPrice: number | null;
+      windowStartPrice: number | null;
+      currentVolume: number | null;
+      averageVolume: number | null;
+      lastTradeTimestamp: string | null;
+      sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
+    }>;
+  } | null;
 };
 
 const listeners = new Set<SnapshotListener>();
@@ -64,6 +86,7 @@ const liveStateStore: SharedLiveStateStore = {
   sessionLabel: null,
   lastCompletedAt: null,
   lastCycleLatencyMs: null,
+  lastEngineDiagnostics: null,
 };
 
 let persistedState: PersistedSessionState | null = null;
@@ -73,7 +96,7 @@ let nextCycleTimer: ReturnType<typeof setTimeout> | null = null;
 let lastDemandAt = 0;
 let cachedUniverseCandidates: WatchlistTicker[] = [];
 let cachedUniverseDiscovery: {
-  source: "live" | "cache" | "fallback_empty";
+  source: "live" | "cache" | "fallback_empty" | "fallback_default";
   discoveredCount: number;
   selectedCount: number;
   topSymbols: string[];
@@ -88,6 +111,155 @@ let cachedUniverseDiscovery: {
 let nextUniverseRefreshAt = 0;
 let cachedNewsByTicker = new Map<string, StructuredNewsSnapshot>();
 let nextNewsRefreshAt = 0;
+const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
+const SCORE_REENTRY_DELTA = 10;
+const CHANGE_REENTRY_DELTA = 1.25;
+const MIN_ACTIONABLE_SCORE = 70;
+const STRONG_BREAKOUT_SCORE = 85;
+const MIN_ACTIONABLE_CHANGE = 1;
+const STRONG_BREAKOUT_CHANGE = 2;
+const NORMAL_SIGNAL_TTL_MS = 10 * 60 * 1000;
+const STRONG_SIGNAL_TTL_MS = 20 * 60 * 1000;
+const SIGNAL_MEMORY_RETENTION_MS = 6 * 60 * 60 * 1000;
+
+type SignalMemory = {
+  symbol: string;
+  lastSignalType: string;
+  lastScore: number;
+  lastChangePercent: number;
+  lastAlertAt: number;
+  lastSeenAt: number;
+  lastBreakoutKey: string;
+  lastEmittedSignal: Signal;
+};
+
+const signalMemoryBySymbol = new Map<string, SignalMemory>();
+
+function buildBreakoutKey(signal: Signal) {
+  return [
+    signal.ticker,
+    signal.signalType,
+    Math.round(signal.finalScore),
+    Math.round(signal.changePercent * 10),
+  ].join("|");
+}
+
+function getSignalReason(signal: Signal) {
+  if (signal.reason && signal.reason.trim().length > 0) return signal.reason;
+
+  const score = Number(signal.finalScore ?? signal.score ?? 0);
+  const change = Number(signal.changePercent ?? 0);
+
+  if (score >= STRONG_BREAKOUT_SCORE && Math.abs(change) >= STRONG_BREAKOUT_CHANGE) {
+    return "Strong momentum breakout with high signal score.";
+  }
+
+  if (score >= MIN_ACTIONABLE_SCORE && Math.abs(change) >= MIN_ACTIONABLE_CHANGE) {
+    return "Fresh momentum detected with confirmed price movement.";
+  }
+
+  return "Selected from current live signal ranking.";
+}
+
+function isActionableMomentum(candidate: Signal) {
+  const score = Number(candidate.finalScore ?? candidate.score ?? 0);
+  const change = Number(candidate.changePercent ?? 0);
+  const freshness = candidate.quoteFreshness === "fresh" || candidate.quoteFreshness === "cached";
+  const hasSource = candidate.quoteProvider === "finnhub" || candidate.quoteProvider === "massive" || candidate.quoteProvider === "twelve_data";
+
+  if (!freshness || !hasSource) {
+    return false;
+  }
+
+  if (score >= STRONG_BREAKOUT_SCORE && Math.abs(change) >= STRONG_BREAKOUT_CHANGE) {
+    if (typeof candidate.relativeVolume === "number") {
+      return candidate.relativeVolume >= 1.5;
+    }
+    return true;
+  }
+
+  return score >= MIN_ACTIONABLE_SCORE && Math.abs(change) >= MIN_ACTIONABLE_CHANGE;
+}
+
+function shouldEmitSignal(candidate: Signal, memory: SignalMemory | undefined, nowMs: number) {
+  const score = Number(candidate.finalScore ?? candidate.score ?? 0);
+  const signalType = String(candidate.signalType ?? "UNKNOWN");
+  const change = Number(candidate.changePercent ?? 0);
+
+  if (!memory) return true;
+
+  const elapsed = nowMs - memory.lastAlertAt;
+  const sameSignalType = memory.lastSignalType === signalType;
+  const scoreImproved = score >= Number(memory.lastScore ?? 0) + SCORE_REENTRY_DELTA;
+  const changeExpanded = Math.abs(change) >= Math.abs(Number(memory.lastChangePercent ?? 0)) + CHANGE_REENTRY_DELTA;
+  const cooldownExpired = elapsed >= SIGNAL_COOLDOWN_MS;
+
+  if (!sameSignalType) return true;
+  if (scoreImproved) return true;
+  if (changeExpanded) return true;
+  if (cooldownExpired && score >= MIN_ACTIONABLE_SCORE) return true;
+
+  return false;
+}
+
+function getSignalTtlMs(signal: Signal) {
+  const score = Number(signal.finalScore ?? signal.score ?? 0);
+  return score >= STRONG_BREAKOUT_SCORE ? STRONG_SIGNAL_TTL_MS : NORMAL_SIGNAL_TTL_MS;
+}
+
+function rememberEmittedSignal(signal: Signal, nowMs: number) {
+  const symbol = signal.ticker;
+  const nextSignal: Signal = {
+    ...signal,
+    reason: getSignalReason(signal),
+    explanationLine: signal.explanationLine || getSignalReason(signal),
+  };
+
+  signalMemoryBySymbol.set(symbol, {
+    symbol,
+    lastSignalType: String(signal.signalType ?? "UNKNOWN"),
+    lastScore: Number(signal.finalScore ?? signal.score ?? 0),
+    lastChangePercent: Number(signal.changePercent ?? 0),
+    lastAlertAt: nowMs,
+    lastSeenAt: nowMs,
+    lastBreakoutKey: buildBreakoutKey(signal),
+    lastEmittedSignal: nextSignal,
+  });
+}
+
+function updateSeenSignal(symbol: string, nowMs: number) {
+  const memory = signalMemoryBySymbol.get(symbol);
+  if (!memory) return;
+  signalMemoryBySymbol.set(symbol, {
+    ...memory,
+    lastSeenAt: nowMs,
+  });
+}
+
+function collectActiveSignalsFromMemory(nowMs: number) {
+  const activeSignals: Signal[] = [];
+
+  for (const [symbol, memory] of signalMemoryBySymbol.entries()) {
+    if (nowMs - memory.lastSeenAt > SIGNAL_MEMORY_RETENTION_MS) {
+      signalMemoryBySymbol.delete(symbol);
+      continue;
+    }
+
+    if (nowMs - memory.lastAlertAt <= getSignalTtlMs(memory.lastEmittedSignal)) {
+      activeSignals.push(memory.lastEmittedSignal);
+    }
+  }
+
+  activeSignals.sort((left, right) => {
+    if (right.finalScore !== left.finalScore) {
+      return right.finalScore - left.finalScore;
+    }
+
+    return right.confidenceScore - left.confidenceScore;
+  });
+
+  return activeSignals;
+}
 
 function createEmptySymbolHealth(): PersistedSymbolHealth {
   return {
@@ -359,8 +531,9 @@ function buildDegradedSessionMessage(quotesResult: {
 }
 
 function getActiveDemandIntervalMs() {
-  const hasRecentDemand = listeners.size > 0 || Date.now() - lastDemandAt < LIVE_SESSION_ACTIVE_DEMAND_WINDOW_MS;
-  return hasRecentDemand ? LIVE_SESSION_FAST_INTERVAL_MS : LIVE_SESSION_IDLE_INTERVAL_MS;
+  const runtimeConfig = getSignalRuntimeConfig();
+  const hasRecentDemand = listeners.size > 0 || Date.now() - lastDemandAt < runtimeConfig.activeDemandWindowMs;
+  return hasRecentDemand ? runtimeConfig.scanIntervalMs : runtimeConfig.idleScanIntervalMs;
 }
 
 function getLastQuoteUpdate(quotes: QuoteSnapshot[]) {
@@ -378,6 +551,14 @@ function deriveFastLaneTickers() {
       ...liveStateStore.volumeMovers.slice(0, LIVE_SESSION_FAST_LANE_VOLUME_COUNT).map((mover) => mover.ticker),
     ]),
   );
+}
+
+function deriveFastLaneTickersForCycle(activeTickers: string[]) {
+  const derived = deriveFastLaneTickers();
+  if (derived.length > 0) {
+    return derived;
+  }
+  return activeTickers.slice(0, Math.min(activeTickers.length, LIVE_SESSION_FAST_LANE_VOLUME_COUNT));
 }
 
 async function ensurePersistedState(sessionDate: string) {
@@ -404,6 +585,7 @@ function updateSharedStore(snapshot: LiveSessionSnapshot, params: {
   volumeMovers: VolumeMover[];
   persistence: PersistenceStatus;
   latencyMs: number;
+  engineDiagnostics: SharedLiveStateStore["lastEngineDiagnostics"];
 }) {
   liveStateStore.version += 1;
   liveStateStore.snapshot = snapshot;
@@ -420,6 +602,7 @@ function updateSharedStore(snapshot: LiveSessionSnapshot, params: {
   liveStateStore.sessionLabel = snapshot.sessionLabel;
   liveStateStore.lastCompletedAt = "generatedAt" in snapshot ? snapshot.generatedAt : snapshot.lastUpdated;
   liveStateStore.lastCycleLatencyMs = params.latencyMs;
+  liveStateStore.lastEngineDiagnostics = params.engineDiagnostics;
 }
 
 function notifyListeners(snapshot: LiveSessionSnapshot) {
@@ -440,7 +623,12 @@ function scheduleNextCycle() {
 
 async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   const startedAt = Date.now();
+  const runtimeConfig = getSignalRuntimeConfig();
   const marketClock = getMarketClock();
+  console.log("[live-session-runtime] heartbeat ok", {
+    sessionStatus: marketClock.sessionStatus,
+    sessionLabel: marketClock.label,
+  });
   const loaded = await ensurePersistedState(marketClock.sessionDate);
   await startMarketStream();
 
@@ -454,7 +642,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       topSymbols: dynamicUniverse.topSymbols,
       reasonsBySymbol: dynamicUniverse.reasonsBySymbol,
     };
-    nextUniverseRefreshAt = Date.now() + UNIVERSE_REFRESH_INTERVAL_MS;
+    nextUniverseRefreshAt = Date.now() + runtimeConfig.universeRefreshMs;
   }
 
   const discoveredCandidates =
@@ -465,14 +653,21 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     loaded.state,
     new Date(startedAt).toISOString(),
     discoveredCandidates,
-    DYNAMIC_UNIVERSE_TARGET_SIZE,
+    runtimeConfig.maxSymbolsPerScan,
   );
   const activeUniverse = universeSelection.activeUniverse;
   const activeTickers = activeUniverse.map((ticker) => ticker.ticker);
-  const fastLaneTickers = deriveFastLaneTickers();
+  console.log("[live-session-runtime] scanning universe", {
+    activeSymbols: activeTickers.length,
+    discoveredCandidates: discoveredCandidates.length,
+  });
+  const fastLaneTickers = deriveFastLaneTickersForCycle(activeTickers);
 
   const quoteSnapshot = getMarketSnapshot(activeTickers);
   const streamHealth = getMarketStreamHealth();
+  console.log("[live-session-runtime] activeUniverse count:", activeTickers.length);
+  console.log("[live-session-runtime] fastLaneTickers count:", fastLaneTickers.length);
+  console.log("[live-session-runtime] massive websocket connected:", streamHealth.connected);
   const quotesResult = {
     ok: quoteSnapshot.quotes.length > 0,
     degraded: quoteSnapshot.degraded || streamHealth.degraded,
@@ -489,6 +684,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     staleAfterMs: quoteSnapshot.staleAfterMs,
     refreshBatchSize: quoteSnapshot.refreshBatchSize,
   };
+  console.log("[live-session-runtime] quotesFresh:", quoteSnapshot.summary.fresh);
+  console.log("[live-session-runtime] quotesFailed:", quoteSnapshot.summary.failed);
 
   const volumeSnapshots = getVolumeSnapshotsForSymbols(activeTickers);
   const volumeResult = {
@@ -508,7 +705,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    nextNewsRefreshAt = Date.now() + NEWS_REFRESH_INTERVAL_MS;
+    nextNewsRefreshAt = Date.now() + runtimeConfig.newsRefreshMs;
   }
 
   const newsSnapshots = activeTickers
@@ -532,6 +729,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   };
 
   const generatedAt = new Date().toISOString();
+  const generatedAtMs = new Date(generatedAt).getTime();
   const engineState = createLiveSignalEngineState();
   engineState.tickers = { ...loaded.state.tickerState };
   const evaluation = evaluateLiveSignals({
@@ -542,12 +740,109 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     newsSnapshots,
     recentEvaluations: loaded.state.recentEvaluations,
     observedAt: generatedAt,
+    sessionStatus: marketClock.sessionStatus,
+    haltGuards: {
+      isStreamReconnecting: streamHealth.reconnecting || streamHealth.inBootstrap || streamHealth.degraded,
+      isRateLimited: streamHealth.rateBudgetLimited,
+    },
+  });
+  const cycleEmittedSignals: Signal[] = [];
+  for (const candidate of evaluation.signals) {
+    const symbol = candidate.ticker;
+    const memory = signalMemoryBySymbol.get(symbol);
+
+    if (!isActionableMomentum(candidate)) {
+      updateSeenSignal(symbol, generatedAtMs);
+      continue;
+    }
+
+    if (!shouldEmitSignal(candidate, memory, generatedAtMs)) {
+      updateSeenSignal(symbol, generatedAtMs);
+      console.log("[live-session-runtime] signal suppressed by cooldown", {
+        symbol,
+        signalType: candidate.signalType,
+        score: candidate.finalScore,
+        changePercent: candidate.changePercent,
+      });
+      continue;
+    }
+
+    rememberEmittedSignal(candidate, generatedAtMs);
+    cycleEmittedSignals.push({
+      ...candidate,
+      reason: getSignalReason(candidate),
+      explanationLine: candidate.explanationLine || getSignalReason(candidate),
+    });
+    console.log("[live-session-runtime] signal emitted", {
+      symbol,
+      signalType: candidate.signalType,
+      score: candidate.finalScore,
+      changePercent: candidate.changePercent,
+    });
+  }
+  const activeSignals = collectActiveSignalsFromMemory(generatedAtMs);
+  if (cycleEmittedSignals.length === 0) {
+    console.log("[live-session-runtime] no actionable momentum this cycle");
+  }
+
+  const volumeByTicker = new Map(volumeResult.snapshots.map((snapshot) => [snapshot.ticker, snapshot]));
+  const topRejected = evaluation.watchlist
+    .filter((item) => !item.hasActiveSignal)
+    .map((item) => ({
+      ticker: item.ticker,
+      reason: item.exclusionReason ?? "none",
+      changePercent: item.changePercent,
+      freshness: item.freshness,
+    }))
+    .sort((left, right) => Math.abs(right.changePercent ?? 0) - Math.abs(left.changePercent ?? 0))
+    .slice(0, 5);
+  const sampleSnapshots = activeUniverse.slice(0, 3).map((ticker) => {
+    const watchlistItem = evaluation.watchlist.find((item) => item.ticker === ticker.ticker);
+    const volumeSnapshot = volumeByTicker.get(ticker.ticker);
+    const history = engineState.tickers[ticker.ticker]?.history ?? [];
+    const generatedAtMs = new Date(evaluation.generatedAt).getTime();
+    const windowHistory = history
+      .filter((point) => generatedAtMs - new Date(point.timestamp).getTime() <= runtimeConfig.momentumWindowMs)
+      .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+    return {
+      ticker: ticker.ticker,
+      lastPrice: watchlistItem?.price ?? null,
+      windowStartPrice: windowHistory[0]?.price ?? null,
+      currentVolume: volumeSnapshot?.currentVolume ?? null,
+      averageVolume: volumeSnapshot?.averageVolume ?? null,
+      lastTradeTimestamp: watchlistItem?.timestamp ?? null,
+      sessionStatus: marketClock.sessionStatus,
+    };
+  });
+  const engineDiagnostics = {
+    evaluatedSymbols: evaluation.watchlist.length,
+    candidateSignals: evaluation.watchlist.filter((item) => Boolean(item.activeSignalType)).length,
+    emittedSignals: cycleEmittedSignals.length,
+    topRejected,
+    sampleSnapshots,
+  };
+  const activeNowLayer = buildLiveAlertsNow({
+    signals: activeSignals,
+    previousState: loaded.state.activeNowState,
+    observedAt: generatedAt,
+    sessionStatus: marketClock.sessionStatus,
+    sensitivityMode: runtimeConfig.sensitivityMode,
   });
   const eventLayer = buildLiveEvents({
-    signals: evaluation.signals,
+    signals: cycleEmittedSignals,
+    liveAlertsNow: activeNowLayer.alerts,
     previousState: loaded.state.eventState,
     observedAt: generatedAt,
     degraded: !quotesResult.ok,
+  });
+  const botFeedLayer = buildBotFeed({
+    previousState: loaded.state.botFeedState,
+    observedAt: generatedAt,
+    sessionStatus: marketClock.sessionStatus,
+    sessionLabel: marketClock.label,
+    signals: activeSignals,
+    liveAlertsNow: activeNowLayer.alerts,
+    events: eventLayer.events,
   });
   const lastQuoteUpdate = getLastQuoteUpdate(quotesResult.quotes);
   const observedHighs = Object.fromEntries(
@@ -579,9 +874,11 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       recentEvaluations: { ...loaded.state.recentEvaluations },
       symbolHealth,
       eventState: eventLayer.nextState,
+      botFeedState: botFeedLayer.nextState,
+      activeNowState: activeNowLayer.nextState,
       lastUpdated: lastQuoteUpdate ?? loaded.state.lastUpdated,
       lastWatchlist: evaluation.watchlist.length > 0 ? evaluation.watchlist : loaded.state.lastWatchlist,
-      lastSignals: loaded.state.lastSignals,
+      lastSignals: activeSignals,
       persistedAt: loaded.state.persistedAt,
     };
     nextPersistenceStatus = await savePersistedSessionState(loaded.state, degradedState);
@@ -599,7 +896,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       sessionDate: marketClock.sessionDate,
       sessionStatus: marketClock.sessionStatus,
       sessionLabel: marketClock.label,
-      signals: evaluation.signals,
+      signals: activeSignals,
       watchlist:
         evaluation.watchlist.length > 0
           ? evaluation.watchlist
@@ -609,6 +906,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       lastUpdated: lastQuoteUpdate ?? loaded.state.lastUpdated,
       persistence: nextPersistenceStatus,
       events: eventLayer.events,
+      liveAlertsNow: activeNowLayer.alerts,
+      botFeed: botFeedLayer.items,
       notifications: eventLayer.notifications,
       volumeMovers,
       volumeMoversMessage,
@@ -616,6 +915,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       universeAdjusted: universeSelection.universeAdjusted,
       universeMessage: universeSelection.universeMessage,
       marketData,
+      diagnostics: engineDiagnostics,
     };
   } else {
     const nextState: PersistedSessionState = {
@@ -625,12 +925,14 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       recentEvaluations: { ...loaded.state.recentEvaluations },
       symbolHealth,
       eventState: eventLayer.nextState,
+      botFeedState: botFeedLayer.nextState,
+      activeNowState: activeNowLayer.nextState,
       lastUpdated: evaluation.generatedAt,
       lastWatchlist: evaluation.watchlist,
-      lastSignals: evaluation.signals,
+      lastSignals: activeSignals,
       persistedAt: loaded.state.persistedAt,
     };
-    appendRecentEvaluations(nextState, evaluation.signals);
+    appendRecentEvaluations(nextState, activeSignals);
     nextPersistenceStatus = await savePersistedSessionState(loaded.state, nextState);
     persistedState = {
       ...nextState,
@@ -656,11 +958,13 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       sessionDate: marketClock.sessionDate,
       sessionStatus: marketClock.sessionStatus,
       sessionLabel: marketClock.label,
-      signals: evaluation.signals,
+      signals: activeSignals,
       watchlist: evaluation.watchlist,
       lastUpdated: lastQuoteUpdate ?? evaluation.generatedAt,
       persistence: nextPersistenceStatus,
       events: eventLayer.events,
+      liveAlertsNow: activeNowLayer.alerts,
+      botFeed: botFeedLayer.items,
       notifications: eventLayer.notifications,
       volumeMovers,
       volumeMoversMessage,
@@ -668,6 +972,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       universeAdjusted: universeSelection.universeAdjusted,
       universeMessage: universeSelection.universeMessage,
       marketData,
+      diagnostics: engineDiagnostics,
     };
   }
 
@@ -675,12 +980,13 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quotes: quotesResult.quotes,
     quoteStates: quotesResult.quoteStates,
     observedHighs,
-    signals: evaluation.signals,
+    signals: activeSignals,
     events: eventLayer.events,
     volumeSnapshots: volumeResult.snapshots,
     volumeMovers,
     persistence: nextPersistenceStatus,
     latencyMs: Date.now() - startedAt,
+    engineDiagnostics,
   });
 
   console.log("[live-session-runtime]", "cycle", {
@@ -715,6 +1021,11 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quotesCached: quotesResult.summary.cached,
     quotesFailed: quotesResult.summary.failed,
     volumeCandidates: volumeResult.snapshots.length,
+    evaluatedSymbols: engineDiagnostics.evaluatedSymbols,
+    candidateSignals: engineDiagnostics.candidateSignals,
+    emittedSignals: engineDiagnostics.emittedSignals,
+    topRejected: engineDiagnostics.topRejected,
+    sampleSnapshots: engineDiagnostics.sampleSnapshots,
     volumeMovers: volumeMovers.length,
     events: eventLayer.events.length,
     notifications: eventLayer.notifications.length,
@@ -766,6 +1077,34 @@ export function getSharedLiveStateStore() {
   };
 }
 
+export function getLiveSessionRuntimeStatus() {
+  const snapshot = liveStateStore.snapshot;
+  const runtimeConfig = getSignalRuntimeConfig();
+  const signalDiagnostics = getLiveSignalEngineCycleDiagnostics();
+  const lastSignalTime =
+    liveStateStore.activeSignals.length > 0
+      ? liveStateStore.activeSignals.reduce((latest, signal) => {
+          return !latest || new Date(signal.timestamp).getTime() > new Date(latest).getTime() ? signal.timestamp : latest;
+        }, null as string | null)
+      : null;
+
+  return {
+    streamConnected: snapshot ? !snapshot.degraded : false,
+    sessionStatus: liveStateStore.sessionStatus ?? "closed",
+    lastScanAt: liveStateStore.lastCompletedAt,
+    lastSignalAt: lastSignalTime,
+    activeUniverseSize: snapshot?.activeUniverseTickers?.length ?? 0,
+    activeSignalCount: liveStateStore.activeSignals.length,
+    scanIntervalMs: runtimeConfig.scanIntervalMs,
+    maxApiCallsPerMinute: runtimeConfig.maxApiCallsPerMinute,
+    maxSymbolsPerScan: runtimeConfig.maxSymbolsPerScan,
+    maxSignalsPerCycle: runtimeConfig.maxSignalsPerCycle,
+    allowExtendedHoursHalt: runtimeConfig.allowExtendedHoursHalt,
+    signalDiagnostics,
+    engineDiagnostics: liveStateStore.lastEngineDiagnostics,
+  };
+}
+
 export function __resetLiveSessionRuntimeForTests() {
   listeners.clear();
 
@@ -789,6 +1128,7 @@ export function __resetLiveSessionRuntimeForTests() {
   nextUniverseRefreshAt = 0;
   cachedNewsByTicker = new Map();
   nextNewsRefreshAt = 0;
+  signalMemoryBySymbol.clear();
   liveStateStore.version = 0;
   liveStateStore.snapshot = null;
   liveStateStore.latestQuotes = [];
@@ -804,4 +1144,5 @@ export function __resetLiveSessionRuntimeForTests() {
   liveStateStore.sessionLabel = null;
   liveStateStore.lastCompletedAt = null;
   liveStateStore.lastCycleLatencyMs = null;
+  liveStateStore.lastEngineDiagnostics = null;
 }
