@@ -157,21 +157,41 @@ export default function HomePage() {
           <p className="mt-4 text-sm text-slate-400">No active signals yet.</p>
         ) : (
           <div className="mt-4 overflow-x-auto">
-            <table className="min-w-[760px] text-sm">
+            <table className="min-w-[1080px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase text-slate-400">
-                  <th className="pr-4">Time</th>
                   <th className="pr-4">Symbol</th>
-                  <th className="pr-4">Signal</th>
-                  <th className="pr-4">Alert</th>
+                  <th className="pr-4">Event</th>
+                  <th className="pr-4">Price Bucket</th>
+                  <th className="pr-4">Change</th>
+                  <th className="pr-4">Alerts</th>
+                  <th className="pr-4">Labels</th>
+                  <th className="pr-4">RVol</th>
+                  <th className="pr-4">Volume</th>
+                  <th className="pr-4">News</th>
+                  <th className="pr-4">Alert Line</th>
                 </tr>
               </thead>
               <tbody>
                 {alertTape.map((signal) => (
                   <tr key={`${signal.ticker}-${signal.alertType}`} className="border-t border-white/10">
-                    <td className="py-2 pr-4 font-semibold">{signal.alertTime}</td>
                     <td className="py-2 pr-4 font-semibold">{signal.ticker}</td>
                     <td className="py-2 pr-4">{signal.alertType}</td>
+                    <td className="py-2 pr-4">{signal.priceBucket}</td>
+                    <td className="py-2 pr-4">{signal.changePercent !== null ? `${signal.changePercent >= 0 ? "+" : ""}${signal.changePercent.toFixed(1)}%` : "n/a"}</td>
+                    <td className="py-2 pr-4">{signal.alertCountToday}</td>
+                    <td className="py-2 pr-4">{signal.alertType === "NHOD" ? "NHOD" : signal.alertType === "GREEN_BARS" ? "3 Green Bars" : signal.alertType === "VOLUME_SPIKE" ? "Volume Burst" : signal.alertType}</td>
+                    <td className="py-2 pr-4">{signal.relativeVolume !== null ? `${signal.relativeVolume.toFixed(1)}x` : "n/a"}</td>
+                    <td className="py-2 pr-4">{signal.currentVolume !== null ? Math.round(signal.currentVolume).toLocaleString("en-US") : "n/a"}</td>
+                    <td className="py-2 pr-4">
+                      {signal.newsUrl ? (
+                        <a href={signal.newsUrl} target="_blank" rel="noreferrer" className="text-sky-300 underline">
+                          Link
+                        </a>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
                     <td className="py-2 pr-4 text-slate-300">
                       {signal.formattedLine || buildAlertLineFallback(signal)}
                       {signal.retained ? ` · ${Math.floor((signal.retainedAgeMs ?? 0) / 60000)}m ago · retained` : ""}

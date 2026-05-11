@@ -25,6 +25,8 @@ type DebugPayload = {
     stocksOnly?: boolean;
     etfRejectedCount?: number;
     rejectedEtfSymbols?: string[];
+    rejectedWarrantSymbols?: string[];
+    unknownAllowedSymbols?: string[];
     retainedUniverse?: boolean;
     retainedUniverseCount?: number;
     retainedSignalCount?: number;
@@ -34,6 +36,10 @@ type DebugPayload = {
     lastSignalReceivedAt?: string | null;
     lastNonEmptySignalTimestamp?: string | null;
     flickerProtectionActive?: boolean;
+    eventsDetectedCount?: number;
+    alertsEmittedCount?: number;
+    cooldownSuppressedCount?: number;
+    newsFetchStatus?: "ok" | "empty" | "error";
     scannerThresholds?: {
       minPrice: number;
       maxPrice: number;
@@ -72,6 +78,11 @@ type DebugPayload = {
       websocketAttempted: boolean;
     };
     reconnectCount?: number;
+    wsMessageSamples?: Array<{
+      messageType: string;
+      keys: string[];
+      updatesParsed: number;
+    }>;
   };
   activeSignalsCount: number;
   alertTapeCount?: number;
@@ -135,8 +146,11 @@ type DebugPayload = {
     stocksOnly?: boolean;
     etfRejectedCount?: number;
     rejectedEtfSymbols?: string[];
+    rejectedWarrantSymbols?: string[];
+    unknownAllowedSymbols?: string[];
     activeUniverseTickers?: string[];
   };
+  candleCountByTicker?: Array<{ ticker: string; candles: number }>;
 };
 
 export default function MonitoringPage() {
@@ -196,6 +210,8 @@ export default function MonitoringPage() {
         <div className="rounded border border-white/10 p-3">Universe Source: {d?.universeSource ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Stocks Only: {String(d?.stocksOnly ?? payload?.dynamicUniverse?.stocksOnly ?? true)}</div>
         <div className="rounded border border-white/10 p-3">ETF Rejected Count: {d?.etfRejectedCount ?? payload?.dynamicUniverse?.etfRejectedCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Unknown Allowed Count: {(d?.rejectionReasonCounts?.unknown_allowed ?? 0)}</div>
+        <div className="rounded border border-white/10 p-3">Selected Common Stock Count: {(d?.rejectionReasonCounts?.selected_common_stock ?? 0)}</div>
         <div className="rounded border border-white/10 p-3">Discovered Before Filters: {d?.discoveredBeforeFilters ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Universe: {d ? `${d.selectedCount} selected / ${d.discoveredCount} discovered` : "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Active Universe: {d?.activeUniverseCount ?? "n/a"}</div>
@@ -221,6 +237,10 @@ export default function MonitoringPage() {
         <div className="rounded border border-white/10 p-3">Last Signal Received At: {d?.lastSignalReceivedAt ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Last Non-empty Signal: {d?.lastNonEmptySignalTimestamp ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Flicker Protection Active: {String(d?.flickerProtectionActive ?? false)}</div>
+        <div className="rounded border border-white/10 p-3">Events Detected: {d?.eventsDetectedCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Alerts Emitted: {d?.alertsEmittedCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Cooldown Suppressions: {d?.cooldownSuppressedCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">News Fetch Status: {d?.newsFetchStatus ?? "n/a"}</div>
       </div>
 
       <section className="mt-6">
@@ -298,6 +318,26 @@ export default function MonitoringPage() {
         <h2 className="text-sm font-semibold uppercase tracking-[0.15em] text-slate-400">Active Universe Tickers</h2>
         <p className="mt-2 text-sm text-slate-300">{payload?.dynamicUniverse?.activeUniverseTickers?.join(", ") || payload?.dynamicUniverse?.topSymbols?.join(", ") || "none"}</p>
         <p className="mt-2 text-sm text-slate-300">Rejected ETF symbols: {(d?.rejectedEtfSymbols ?? payload?.dynamicUniverse?.rejectedEtfSymbols ?? []).slice(0, 20).join(", ") || "none"}</p>
+        <p className="mt-2 text-sm text-slate-300">Rejected warrant symbols: {(d?.rejectedWarrantSymbols ?? payload?.dynamicUniverse?.rejectedWarrantSymbols ?? []).slice(0, 20).join(", ") || "none"}</p>
+        <p className="mt-2 text-sm text-slate-300">Unknown-allowed symbols: {(d?.unknownAllowedSymbols ?? payload?.dynamicUniverse?.unknownAllowedSymbols ?? []).slice(0, 20).join(", ") || "none"}</p>
+      </section>
+
+      <section className="mt-6">
+        <h2 className="text-sm font-semibold uppercase tracking-[0.15em] text-slate-400">Candle Count By Ticker</h2>
+        <div className="mt-2 space-y-1 text-sm text-slate-300">
+          {(payload?.candleCountByTicker ?? []).slice(0, 30).map((row) => (
+            <p key={row.ticker}>{row.ticker}: {row.candles}</p>
+          ))}
+        </div>
+      </section>
+
+      <section className="mt-6">
+        <h2 className="text-sm font-semibold uppercase tracking-[0.15em] text-slate-400">Raw WS Message Samples</h2>
+        <div className="mt-2 space-y-1 text-sm text-slate-300">
+          {(payload?.websocket?.wsMessageSamples ?? []).slice(0, 20).map((sample, index) => (
+            <p key={`${sample.messageType}-${index}`}>{sample.messageType}: {sample.keys.join(", ")} (updates={sample.updatesParsed})</p>
+          ))}
+        </div>
       </section>
 
       <section className="mt-6">

@@ -3,6 +3,7 @@ import { getLiveSessionSnapshot, getRunnerAlertDebugState } from "@/lib/live-ses
 import { getMarketStreamHealth, getDynamicUniverse, startMarketStream } from "@/lib/market-stream";
 import { getMarketClock } from "@/lib/market-session";
 import { getMassiveApiKey } from "@/lib/providers/massive";
+import { getCandleCounts } from "@/lib/candle-store";
 
 export const dynamic = "force-dynamic";
 
@@ -80,6 +81,7 @@ export async function GET() {
         lastAggregateAt: health.lastAggregateAt,
         startup: health.startup,
         reconnectCount: health.reconnectCount,
+        wsMessageSamples: health.wsMessageSamples,
         degraded: health.degraded,
         degradedReason: health.degradedReason,
       },
@@ -92,6 +94,8 @@ export async function GET() {
         stocksOnly: true,
         etfRejectedCount: universe.etfRejectedCount ?? 0,
         rejectedEtfSymbols: universe.rejectedEtfSymbols ?? [],
+        rejectedWarrantSymbols: universe.rejectedWarrantSymbols ?? [],
+        unknownAllowedSymbols: universe.unknownAllowedSymbols ?? [],
         activeUniverseTickers: snapshot.activeUniverseTickers ?? [],
       },
       quoteSummary: snapshot.marketData?.summary ?? null,
@@ -118,6 +122,7 @@ export async function GET() {
         watchlistEvaluated: snapshot.watchlist.length,
         emittedAlerts: snapshot.alerts.length,
       },
+      candleCountByTicker: getCandleCounts(),
       missingDataFields,
       highTracking: alertDebug.highTracking,
       suppressedDuplicateAlerts: alertDebug.suppressedDuplicates,

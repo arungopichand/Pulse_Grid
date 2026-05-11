@@ -1,5 +1,5 @@
 import { getMassiveApiKey } from "./providers/massive";
-import { isCommonStockCandidate } from "./instrument-filter";
+import { classifyInstrumentCandidate } from "./instrument-filter";
 import type { WatchlistTicker } from "./watchlist";
 
 type MassiveSnapshotBar = {
@@ -29,7 +29,12 @@ type UniverseRejectionReason =
   | "low_relative_volume"
   | "low_change"
   | "bearish_filtered"
-  | "etf_or_fund";
+  | "etf_or_fund"
+  | "warrant_filtered"
+  | "unit_filtered"
+  | "right_filtered"
+  | "unknown_allowed"
+  | "selected_common_stock";
 
 type DiscoveredTicker = {
   ticker: string;
@@ -62,6 +67,8 @@ export type DynamicMarketUniverseResult = {
   rejectionReasonCounts: Record<UniverseRejectionReason, number>;
   etfRejectedCount?: number;
   rejectedEtfSymbols?: string[];
+  rejectedWarrantSymbols?: string[];
+  unknownAllowedSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -252,15 +259,37 @@ export async function getDynamicMarketUniverse(
     low_change: 0,
     bearish_filtered: 0,
     etf_or_fund: 0,
+    warrant_filtered: 0,
+    unit_filtered: 0,
+    right_filtered: 0,
+    unknown_allowed: 0,
+    selected_common_stock: 0,
   };
   const rejectedEtfSymbols: string[] = [];
+  const rejectedWarrantSymbols: string[] = [];
+  const unknownAllowedSymbols: string[] = [];
 
   const passed: DiscoveredTicker[] = [];
   for (const row of dedupedRaw.values()) {
-    if (!isCommonStockCandidate({ ticker: row.ticker })) {
-      rejectionReasonCounts.etf_or_fund += 1;
-      if (rejectedEtfSymbols.length < 50) rejectedEtfSymbols.push(row.ticker);
+    const classification = classifyInstrumentCandidate({ ticker: row.ticker });
+    if (!classification.allowed) {
+      if (
+        classification.reason === "etf_or_fund" ||
+        classification.reason === "warrant_filtered" ||
+        classification.reason === "unit_filtered" ||
+        classification.reason === "right_filtered"
+      ) {
+        rejectionReasonCounts[classification.reason] += 1;
+      }
+      if (classification.reason === "etf_or_fund" && rejectedEtfSymbols.length < 50) rejectedEtfSymbols.push(row.ticker);
+      if (classification.reason === "warrant_filtered" && rejectedWarrantSymbols.length < 50) rejectedWarrantSymbols.push(row.ticker);
       continue;
+    }
+    if (classification.reason === "unknown_allowed") {
+      rejectionReasonCounts.unknown_allowed += 1;
+      if (unknownAllowedSymbols.length < 50) unknownAllowedSymbols.push(row.ticker);
+    } else {
+      rejectionReasonCounts.selected_common_stock += 1;
     }
     const rejection = validateEntry(row, scanner);
     if (rejection) {
@@ -268,7 +297,7 @@ export async function getDynamicMarketUniverse(
       continue;
     }
     const rankScore = buildRankScore(row);
-    const reason = `source=${row.source} move=${row.changePercent.toFixed(2)}% price=$${row.price.toFixed(2)} vol=${Math.round(row.currentVolume)} rvol=${row.relativeVolume !== null ? row.relativeVolume.toFixed(2) : "n/a"} liq=${Math.round(row.dollarLiquidity)}`;
+    const reason = `source=${row.source} move=${row.changePercent.toFixed(2)}% price=$${row.price.toFixed(2)} vol=${Math.round(row.currentVolume)} rvol=${row.relativeVolume !== null ? row.relativeVolume.toFixed(2) : "n/a"} liq=${Math.round(row.dollarLiquidity)} class=${classification.reason} confidence=${classification.confidence}`;
     passed.push({ ...row, rankScore, reason });
   }
 
@@ -298,6 +327,8 @@ export async function getDynamicMarketUniverse(
     rejectionReasonCounts,
     etfRejectedCount: rejectionReasonCounts.etf_or_fund,
     rejectedEtfSymbols: rejectedEtfSymbols.slice(0, 20),
+    rejectedWarrantSymbols: rejectedWarrantSymbols.slice(0, 20),
+    unknownAllowedSymbols: unknownAllowedSymbols.slice(0, 20),
     topCandidates: ranked.slice(0, 20).map((entry) => ({
       ticker: entry.ticker,
       price: entry.price,

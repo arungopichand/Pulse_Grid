@@ -142,6 +142,12 @@ export type LiveSessionSnapshot =
         stocksOnly?: boolean;
         etfRejectedCount?: number;
         rejectedEtfSymbols?: string[];
+        rejectedWarrantSymbols?: string[];
+        unknownAllowedSymbols?: string[];
+        eventsDetectedCount?: number;
+        alertsEmittedCount?: number;
+        cooldownSuppressedCount?: number;
+        newsFetchStatus?: "ok" | "empty" | "error";
         retainedUniverse?: boolean;
         retainedUniverseCount?: number;
         retainedSignalCount?: number;
@@ -246,6 +252,12 @@ export type LiveSessionSnapshot =
         stocksOnly?: boolean;
         etfRejectedCount?: number;
         rejectedEtfSymbols?: string[];
+        rejectedWarrantSymbols?: string[];
+        unknownAllowedSymbols?: string[];
+        eventsDetectedCount?: number;
+        alertsEmittedCount?: number;
+        cooldownSuppressedCount?: number;
+        newsFetchStatus?: "ok" | "empty" | "error";
         retainedUniverse?: boolean;
         retainedUniverseCount?: number;
         retainedSignalCount?: number;

@@ -24,6 +24,11 @@ import {
 } from "./market-stream";
 import { getMassiveApiKey } from "./providers/massive";
 import { isCommonStockCandidate } from "./instrument-filter";
+import { detectMomentumEvents } from "./event-detector";
+import { fetchMassiveNewsForTicker } from "./news-service";
+import { noteEmittedEventAlert, shouldEmitEventAlert } from "./alert-engine";
+import { attachSymbolNews, noteSymbolAlert, upsertSymbolMemory } from "./symbol-memory";
+import { getLastNCandles } from "./candle-store";
 import type { RunnerAlert } from "./runner-alerts";
 import type { WatchlistTicker } from "./watchlist";
 
@@ -118,6 +123,8 @@ let cachedUniverseDiscovery: {
   rejectionReasonCounts: Record<string, number>;
   etfRejectedCount?: number;
   rejectedEtfSymbols?: string[];
+  rejectedWarrantSymbols?: string[];
+  unknownAllowedSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -144,6 +151,8 @@ let cachedUniverseDiscovery: {
   rejectionReasonCounts: {},
   etfRejectedCount: 0,
   rejectedEtfSymbols: [],
+  rejectedWarrantSymbols: [],
+  unknownAllowedSymbols: [],
   topCandidates: [],
 };
 let nextUniverseRefreshAt = 0;
@@ -877,6 +886,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       rejectionReasonCounts: dynamicUniverse.rejectionReasonCounts,
       etfRejectedCount: dynamicUniverse.etfRejectedCount ?? 0,
       rejectedEtfSymbols: dynamicUniverse.rejectedEtfSymbols ?? [],
+      rejectedWarrantSymbols: dynamicUniverse.rejectedWarrantSymbols ?? [],
+      unknownAllowedSymbols: dynamicUniverse.unknownAllowedSymbols ?? [],
       topCandidates: dynamicUniverse.topCandidates,
     };
     nextUniverseRefreshAt = Date.now() + runtimeConfig.universeRefreshMs;
@@ -954,6 +965,20 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   const newsSnapshots = activeTickers
     .map((ticker) => cachedNewsByTicker.get(ticker))
     .filter((item): item is StructuredNewsSnapshot => Boolean(item));
+  const massiveNewsByTicker = new Map<string, Awaited<ReturnType<typeof fetchMassiveNewsForTicker>>>();
+  let massiveNewsFetchStatus: "ok" | "empty" | "error" = "empty";
+  try {
+    const batch = activeTickers.slice(0, 20);
+    const settledNews = await Promise.allSettled(batch.map((ticker) => fetchMassiveNewsForTicker(ticker)));
+    settledNews.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        massiveNewsByTicker.set(batch[index], result.value);
+      }
+    });
+    massiveNewsFetchStatus = massiveNewsByTicker.size > 0 ? "ok" : "empty";
+  } catch {
+    massiveNewsFetchStatus = "error";
+  }
 
   const volumeMovers = volumeResult.ok ? computeVolumeMovers(volumeResult.snapshots) : [];
   const volumeMoversMessage =
@@ -1014,6 +1039,12 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     stocksOnly: true,
     etfRejectedCount: cachedUniverseDiscovery.etfRejectedCount ?? 0,
     rejectedEtfSymbols: cachedUniverseDiscovery.rejectedEtfSymbols ?? [],
+    rejectedWarrantSymbols: cachedUniverseDiscovery.rejectedWarrantSymbols ?? [],
+    unknownAllowedSymbols: cachedUniverseDiscovery.unknownAllowedSymbols ?? [],
+    eventsDetectedCount: 0 as number,
+    alertsEmittedCount: 0 as number,
+    cooldownSuppressedCount: 0 as number,
+    newsFetchStatus: massiveNewsFetchStatus,
     retainedUniverse: cachedUniverseDiscovery.source === "retained_previous",
     retainedUniverseCount: cachedUniverseDiscovery.source === "retained_previous" ? cachedUniverseCandidates.length : 0,
     retainedSignalCount: 0 as number,
@@ -1222,6 +1253,37 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     if (!isCommonStockCandidate({ ticker: signal.ticker, instrumentType: signal.instrumentType, company: signal.company })) {
       continue;
     }
+    const latestNews = massiveNewsByTicker.get(signal.ticker)?.[0] ?? null;
+    if (latestNews) {
+      attachSymbolNews(signal.ticker, {
+        title: latestNews.title,
+        articleUrl: latestNews.articleUrl,
+        publishedUtc: latestNews.publishedUtc,
+      });
+      if (!signal.newsHeadline) {
+        signal.newsHeadline = latestNews.title;
+      }
+      if (!signal.newsUrl) {
+        signal.newsUrl = latestNews.articleUrl;
+      }
+    }
+    const symbolMemory = upsertSymbolMemory({
+      ticker: signal.ticker,
+      price: signal.price ?? null,
+      volume: signal.currentVolume ?? null,
+      sessionStatus: marketClock.sessionStatus,
+      candles1m: getLastNCandles(signal.ticker, 60).length,
+    });
+    const events = detectMomentumEvents({
+      ticker: signal.ticker,
+      price: signal.price ?? null,
+      changePercent: signal.changePercent ?? null,
+      volume: signal.currentVolume ?? null,
+      relativeVolume: signal.relativeVolume ?? null,
+      hasNews: Boolean(signal.newsHeadline),
+      isFirstSeen: symbolMemory?.alertCount === 0,
+    });
+    scannerDiagnostics.eventsDetectedCount = (scannerDiagnostics.eventsDetectedCount ?? 0) + events.length;
     const prior = runnerAlertStateByTicker.get(signal.ticker) ?? {
       ticker: signal.ticker,
       sessionDate: marketClock.sessionDate,
@@ -1322,12 +1384,21 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       generatedAtMs - prior.lastAlertAt < RUNNER_ALERT_MIN_REPEAT_MS &&
       !volImproved &&
       !rvolImproved;
+    const eventToCheck = events[0] ?? null;
+    const shouldEmitByEventEngine =
+      eventToCheck !== null
+        ? shouldEmitEventAlert({
+            ticker: signal.ticker,
+            event: eventToCheck,
+            newsId: latestNews?.id ?? null,
+          })
+        : true;
     const shouldEmit =
       alertType === "VOLUME_SPIKE"
-        ? isVolumeSpike && quoteFreshEnough && withinScannerPriceBounds && !recentAlertSuppressed
+        ? isVolumeSpike && quoteFreshEnough && withinScannerPriceBounds && !recentAlertSuppressed && shouldEmitByEventEngine
         : alertType === "TEST"
           ? false
-          : shouldEmitBase;
+          : shouldEmitBase && shouldEmitByEventEngine;
     const direction: "up" | "down" | "flat" = signal.changePercent > 0 ? "up" : signal.changePercent < 0 ? "down" : "flat";
     const alertCountToday = shouldEmit ? prior.alertCountToday + 1 : prior.alertCountToday;
     const timeLabel = new Date(signal.timestamp).toLocaleTimeString("en-US", {
@@ -1458,8 +1529,26 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       suppressedReason,
     });
     if (shouldEmit) {
+      if (eventToCheck) {
+        noteEmittedEventAlert({
+          ticker: signal.ticker,
+          event: eventToCheck,
+          newsId: latestNews?.id ?? null,
+        });
+      }
+      noteSymbolAlert({
+        ticker: signal.ticker,
+        signalType: alertType,
+        price: signal.price ?? null,
+        volume: signal.currentVolume ?? null,
+        retainedUntil: new Date(Date.now() + ((signal.finalScore ?? 0) >= 85 ? 20 * 60_000 : 10 * 60_000)).toISOString(),
+      });
+      scannerDiagnostics.alertsEmittedCount = (scannerDiagnostics.alertsEmittedCount ?? 0) + 1;
       alerts.push(enrichedAlert);
     } else {
+      if (!shouldEmitByEventEngine) {
+        scannerDiagnostics.cooldownSuppressedCount = (scannerDiagnostics.cooldownSuppressedCount ?? 0) + 1;
+      }
       suppressedDuplicateAlerts.push({
         time: signal.timestamp,
         ticker: signal.ticker,

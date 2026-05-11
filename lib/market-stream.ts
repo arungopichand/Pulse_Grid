@@ -6,6 +6,7 @@ import { consumeRateLimitToken } from "./request-rate-limiter";
 import { getSignalRuntimeConfig } from "./signal-runtime-config";
 import type { WatchlistTicker } from "./watchlist";
 import type { VolumeSnapshot } from "./volume-data";
+import { upsertCandleFromAggregate, upsertCandleFromTick } from "./candle-store";
 
 type StreamConnectionState = "idle" | "connecting" | "connected" | "disconnected" | "degraded";
 
@@ -131,6 +132,8 @@ type DynamicUniverseState = {
   rejectionReasonCounts: Record<string, number>;
   etfRejectedCount?: number;
   rejectedEtfSymbols?: string[];
+  rejectedWarrantSymbols?: string[];
+  unknownAllowedSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -233,6 +236,8 @@ function createManager(): MarketStreamManager {
       rejectionReasonCounts: {},
       etfRejectedCount: 0,
       rejectedEtfSymbols: [],
+      rejectedWarrantSymbols: [],
+      unknownAllowedSymbols: [],
       topCandidates: [],
     },
     streamSocket: null,
@@ -702,6 +707,17 @@ async function connectSocket(reason: string) {
         const ts = tsRaw !== null ? (tsRaw > 9_999_999_999_999 ? Math.floor(tsRaw / 1_000_000) : tsRaw) : Date.now();
         if (ev === "T") {
           manager.lastTradeAt = Date.now();
+          const symbol = typeof entry.sym === "string" ? entry.sym.trim().toUpperCase() : "";
+          const price = parseNumber(entry.p) ?? parseNumber(entry.price);
+          const tsIso = new Date(ts).toISOString();
+          if (symbol && price !== null) {
+            upsertCandleFromTick({
+              ticker: symbol,
+              price,
+              volumeDelta: parseNumber(entry.s) ?? parseNumber(entry.v) ?? null,
+              timestamp: tsIso,
+            });
+          }
         }
         if (ev === "AM") {
           manager.lastAggregateAt = Date.now();
@@ -712,6 +728,15 @@ async function connectSocket(reason: string) {
           const close = parseNumber(entry.c);
           const volume = parseNumber(entry.v);
           if (symbol && close !== null) {
+            upsertCandleFromAggregate({
+              ticker: symbol,
+              open: open ?? close,
+              high: high ?? close,
+              low: low ?? close,
+              close,
+              volume: volume ?? 0,
+              timestamp: new Date(ts).toISOString(),
+            });
             updateSymbolState({
               ticker: symbol,
               price: close,
@@ -845,6 +870,8 @@ async function refreshUniverse() {
     rejectionReasonCounts: discovered.rejectionReasonCounts,
     etfRejectedCount: discovered.etfRejectedCount ?? 0,
     rejectedEtfSymbols: discovered.rejectedEtfSymbols ?? [],
+    rejectedWarrantSymbols: discovered.rejectedWarrantSymbols ?? [],
+    unknownAllowedSymbols: discovered.unknownAllowedSymbols ?? [],
     topCandidates: discovered.topCandidates,
   };
   manager.lastUniverseCount = candidates.length;
@@ -1184,6 +1211,8 @@ export function getDynamicUniverse() {
     rejectionReasonCounts: manager.dynamicUniverse.rejectionReasonCounts,
     etfRejectedCount: manager.dynamicUniverse.etfRejectedCount ?? 0,
     rejectedEtfSymbols: manager.dynamicUniverse.rejectedEtfSymbols ?? [],
+    rejectedWarrantSymbols: manager.dynamicUniverse.rejectedWarrantSymbols ?? [],
+    unknownAllowedSymbols: manager.dynamicUniverse.unknownAllowedSymbols ?? [],
     topCandidates: manager.dynamicUniverse.topCandidates,
   };
 }

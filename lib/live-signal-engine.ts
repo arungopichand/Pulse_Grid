@@ -159,6 +159,11 @@ export type Signal = {
   retained?: boolean;
   retainedReason?: string | null;
   retainedAgeMs?: number | null;
+  alertCount?: number;
+  catalystType?: string | null;
+  catalystTitle?: string | null;
+  catalystUrl?: string | null;
+  country?: string | null;
 };
 
 export type WatchlistQuote = WatchlistTicker & {
