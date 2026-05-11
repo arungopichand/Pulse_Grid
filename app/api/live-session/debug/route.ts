@@ -79,6 +79,7 @@ export async function GET() {
         lastTradeAt: health.lastTradeAt,
         lastAggregateAt: health.lastAggregateAt,
         startup: health.startup,
+        reconnectCount: health.reconnectCount,
         degraded: health.degraded,
         degradedReason: health.degradedReason,
       },

@@ -44,5 +44,7 @@ export type RunnerAlert = {
   score: number;
   reason: string;
   formattedLine: string;
+  retained?: boolean;
+  retainedReason?: string | null;
+  retainedAgeMs?: number | null;
 };
-

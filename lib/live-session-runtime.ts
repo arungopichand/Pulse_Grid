@@ -100,7 +100,7 @@ let nextCycleTimer: ReturnType<typeof setTimeout> | null = null;
 let lastDemandAt = 0;
 let cachedUniverseCandidates: WatchlistTicker[] = [];
 let cachedUniverseDiscovery: {
-  source: "live" | "cache" | "fallback_empty";
+  source: "live" | "cache" | "fallback_empty" | "retained_previous";
   discoveredCount: number;
   discoveredBeforeFilters: number;
   selectedCount: number;
@@ -142,6 +142,8 @@ let cachedUniverseDiscovery: {
   topCandidates: [],
 };
 let nextUniverseRefreshAt = 0;
+let lastNonEmptyUniverseCandidates: WatchlistTicker[] = [];
+let lastNonEmptyUniverseAt = 0;
 let cachedNewsByTicker = new Map<string, StructuredNewsSnapshot>();
 let nextNewsRefreshAt = 0;
 const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
@@ -153,6 +155,8 @@ const MIN_ACTIONABLE_CHANGE = 1;
 const STRONG_BREAKOUT_CHANGE = 2;
 const NORMAL_SIGNAL_TTL_MS = 10 * 60 * 1000;
 const STRONG_SIGNAL_TTL_MS = 20 * 60 * 1000;
+const STALE_QUOTE_EVICT_MS = 2 * 60 * 1000;
+const UNIVERSE_STICKINESS_MS = 3 * 60 * 1000;
 const SIGNAL_MEMORY_RETENTION_MS = 6 * 60 * 60 * 1000;
 const RUNNER_ALERT_MIN_REPEAT_MS = 3 * 60_000;
 
@@ -427,6 +431,7 @@ function updateSeenSignal(symbol: string, nowMs: number) {
 
 function collectActiveSignalsFromMemory(nowMs: number) {
   const activeSignals: Signal[] = [];
+  const maxPrice = cachedUniverseDiscovery.scannerThresholds.maxPrice;
 
   for (const [symbol, memory] of signalMemoryBySymbol.entries()) {
     if (nowMs - memory.lastSeenAt > SIGNAL_MEMORY_RETENTION_MS) {
@@ -434,33 +439,36 @@ function collectActiveSignalsFromMemory(nowMs: number) {
       continue;
     }
 
+    const price = Number(memory.lastEmittedSignal.price ?? 0);
+    const changePercent = Number(memory.lastEmittedSignal.changePercent ?? 0);
+    if (price > maxPrice || changePercent <= -7) {
+      signalMemoryBySymbol.delete(symbol);
+      continue;
+    }
+
+    if (nowMs - memory.lastSeenAt > STALE_QUOTE_EVICT_MS) {
+      signalMemoryBySymbol.delete(symbol);
+      continue;
+    }
+
     if (nowMs - memory.lastAlertAt <= getSignalTtlMs(memory.lastEmittedSignal)) {
-      activeSignals.push(memory.lastEmittedSignal);
+      const retainedAgeMs = Math.max(0, nowMs - memory.lastAlertAt);
+      const retained = retainedAgeMs > getActiveDemandIntervalMs();
+      activeSignals.push({
+        ...memory.lastEmittedSignal,
+        retained,
+        retainedReason: retained ? "Last valid live signal retained while waiting for next confirmation." : null,
+        retainedAgeMs,
+      });
     }
   }
 
   activeSignals.sort((left, right) => {
-    const leftRecent = left.emittedAt ? new Date(left.emittedAt).getTime() : new Date(left.timestamp).getTime();
-    const rightRecent = right.emittedAt ? new Date(right.emittedAt).getTime() : new Date(right.timestamp).getTime();
-    if (rightRecent !== leftRecent) {
-      return rightRecent - leftRecent;
-    }
-
-    if (right.confidenceScore !== left.confidenceScore) {
-      return right.confidenceScore - left.confidenceScore;
-    }
-
-    if (right.finalScore !== left.finalScore) {
-      return right.finalScore - left.finalScore;
-    }
-
-    const rightSeq = right.alertSequence ?? 0;
-    const leftSeq = left.alertSequence ?? 0;
-    if (rightSeq !== leftSeq) {
-      return rightSeq - leftSeq;
-    }
-
-    return Math.abs(right.changePercent) - Math.abs(left.changePercent);
+    const scoreDelta = (right.finalScore ?? right.score ?? 0) - (left.finalScore ?? left.score ?? 0);
+    if (scoreDelta !== 0) return scoreDelta;
+    const changeDelta = (right.changePercent ?? 0) - (left.changePercent ?? 0);
+    if (changeDelta !== 0) return changeDelta;
+    return left.ticker.localeCompare(right.ticker);
   });
 
   return activeSignals;
@@ -843,14 +851,23 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
 
   if (Date.now() >= nextUniverseRefreshAt || cachedUniverseCandidates.length === 0) {
     const dynamicUniverse = getDynamicUniverseFromStream();
-    cachedUniverseCandidates = dynamicUniverse.symbols;
+    const discoveryEmpty = dynamicUniverse.symbols.length === 0;
+    const canRetainUniverse =
+      discoveryEmpty &&
+      lastNonEmptyUniverseCandidates.length > 0 &&
+      Date.now() - lastNonEmptyUniverseAt <= UNIVERSE_STICKINESS_MS;
+    cachedUniverseCandidates = canRetainUniverse ? lastNonEmptyUniverseCandidates : dynamicUniverse.symbols;
+    if (dynamicUniverse.symbols.length > 0) {
+      lastNonEmptyUniverseCandidates = dynamicUniverse.symbols;
+      lastNonEmptyUniverseAt = Date.now();
+    }
     cachedUniverseDiscovery = {
-      source: dynamicUniverse.source,
+      source: canRetainUniverse ? "retained_previous" : dynamicUniverse.source,
       discoveredCount: dynamicUniverse.discoveredCount,
       discoveredBeforeFilters: dynamicUniverse.discoveredBeforeFilters,
-      selectedCount: dynamicUniverse.selectedCount,
-      topSymbols: dynamicUniverse.topSymbols,
-      reasonsBySymbol: dynamicUniverse.reasonsBySymbol,
+      selectedCount: canRetainUniverse ? lastNonEmptyUniverseCandidates.length : dynamicUniverse.selectedCount,
+      topSymbols: canRetainUniverse ? lastNonEmptyUniverseCandidates.slice(0, 20).map((ticker) => ticker.ticker) : dynamicUniverse.topSymbols,
+      reasonsBySymbol: canRetainUniverse ? { __universe__: "Retained previous active universe while waiting for next discovery refresh." } : dynamicUniverse.reasonsBySymbol,
       scannerThresholds: dynamicUniverse.scannerThresholds,
       rejectionReasonCounts: dynamicUniverse.rejectionReasonCounts,
       topCandidates: dynamicUniverse.topCandidates,
@@ -981,6 +998,15 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quoteStale: quotesResult.summary.stale,
     quoteFailed: quotesResult.summary.failed,
     primaryMessages,
+    retainedUniverse: cachedUniverseDiscovery.source === "retained_previous",
+    retainedUniverseCount: cachedUniverseDiscovery.source === "retained_previous" ? cachedUniverseCandidates.length : 0,
+    retainedSignalCount: 0 as number,
+    activeSignalMemoryCount: signalMemoryBySymbol.size,
+    latestSnapshotSignalCount: 0 as number,
+    uiRetentionTtlMs: NORMAL_SIGNAL_TTL_MS,
+    lastSignalReceivedAt: null as string | null,
+    lastNonEmptySignalTimestamp: null as string | null,
+    flickerProtectionActive: false as boolean,
     scannerThresholds: cachedUniverseDiscovery.scannerThresholds,
     rejectionReasonCounts: { ...cachedUniverseDiscovery.rejectionReasonCounts },
     topCandidates: cachedUniverseDiscovery.topCandidates,
@@ -1046,6 +1072,24 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     });
   }
   const activeSignals = collectActiveSignalsFromMemory(generatedAtMs);
+  const retainedSignalCount = activeSignals.filter((signal) => signal.retained).length;
+  const memoryLastSignalAt =
+    [...signalMemoryBySymbol.values()]
+      .map((memory) => memory.lastSeenAt)
+      .sort((a, b) => b - a)[0] ?? null;
+  const lastNonEmptySignalTimestamp =
+    activeSignals.length > 0
+      ? [...activeSignals]
+          .sort((a, b) => new Date(b.emittedAt ?? b.timestamp).getTime() - new Date(a.emittedAt ?? a.timestamp).getTime())[0]?.emittedAt ??
+        [...activeSignals].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0]?.timestamp ??
+        null
+      : null;
+  scannerDiagnostics.retainedSignalCount = retainedSignalCount;
+  scannerDiagnostics.activeSignalMemoryCount = signalMemoryBySymbol.size;
+  scannerDiagnostics.latestSnapshotSignalCount = cycleEmittedSignals.length;
+  scannerDiagnostics.lastSignalReceivedAt = memoryLastSignalAt ? new Date(memoryLastSignalAt).toISOString() : null;
+  scannerDiagnostics.lastNonEmptySignalTimestamp = lastNonEmptySignalTimestamp;
+  scannerDiagnostics.flickerProtectionActive = retainedSignalCount > 0 || scannerDiagnostics.retainedUniverse === true;
   if (hasAnyQuotes && activeSignals.length === 0) {
     const liveQuotesNoSignalMessage = "Live quotes available but no signal passed momentum filters.";
     if (!scannerDiagnostics.primaryMessages.includes(liveQuotesNoSignalMessage)) {
@@ -1353,6 +1397,9 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       score: signal.finalScore,
       reason: signal.reason,
       formattedLine,
+      retained: signal.retained ?? false,
+      retainedReason: signal.retainedReason ?? null,
+      retainedAgeMs: signal.retainedAgeMs ?? null,
     };
 
     runnerAlertStateByTicker.set(signal.ticker, {
@@ -1821,6 +1868,8 @@ export function __resetLiveSessionRuntimeForTests() {
     topCandidates: [],
   };
   nextUniverseRefreshAt = 0;
+  lastNonEmptyUniverseCandidates = [];
+  lastNonEmptyUniverseAt = 0;
   cachedNewsByTicker = new Map();
   nextNewsRefreshAt = 0;
   signalMemoryBySymbol.clear();

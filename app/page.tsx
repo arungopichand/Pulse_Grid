@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchLiveSessionSnapshot } from "@/lib/market-data";
 import type { RunnerAlert } from "@/lib/runner-alerts";
 
 function buildAlertLineFallback(alert: RunnerAlert) {
-  const arrow = alert.direction === "up" ? "↑" : alert.direction === "down" ? "↓" : "→";
+  const arrow = alert.direction === "up" ? "\u2191" : alert.direction === "down" ? "\u2193" : "\u2192";
   return `${alert.alertTime} ${arrow} ${alert.ticker} ${alert.priceBucket} ${alert.alertType}`;
 }
 
@@ -27,14 +27,76 @@ function getStatusLine(params: {
 }
 
 export default function HomePage() {
-  const [alerts, setAlerts] = useState<RunnerAlert[]>([]);
+  type UiAlert = RunnerAlert & {
+    retained: boolean;
+    retainedReason: string | null;
+    retainedAgeMs: number;
+    lastSeenAt: number;
+  };
+  const [alerts, setAlerts] = useState<UiAlert[]>([]);
+  const lastNonEmptyAlertAtRef = useRef<number | null>(null);
+  const [frontendRetained, setFrontendRetained] = useState(false);
   const [sessionStatus, setSessionStatus] = useState<"premarket" | "regular" | "after-hours" | "closed">("closed");
   const [streamConnected, setStreamConnected] = useState<boolean | null>(null);
 
   const applySnapshot = useCallback((result: Awaited<ReturnType<typeof fetchLiveSessionSnapshot>>) => {
-    setAlerts(result.alerts ?? []);
+    const incomingAlerts = (result.alerts ?? []).filter((alert) => alert.alertType !== "TEST");
     setSessionStatus(result.sessionStatus);
     setStreamConnected(result.streamHealth?.connected ?? null);
+    const reconnecting = result.streamHealth?.reconnecting ?? false;
+    const degraded = result.degraded || (result.streamHealth?.degraded ?? false);
+    const now = Date.now();
+    const maxPrice = result.scannerDiagnostics?.scannerThresholds?.maxPrice ?? 20;
+
+    setAlerts((previous) => {
+      const byKey = new Map(previous.map((item) => [`${item.ticker}-${item.alertType}`, item] as const));
+      const nextByKey = new Map<string, UiAlert>();
+
+      for (const alert of incomingAlerts) {
+        const key = `${alert.ticker}-${alert.alertType}`;
+        nextByKey.set(key, {
+          ...alert,
+          retained: false,
+          retainedReason: null,
+          retainedAgeMs: 0,
+          lastSeenAt: now,
+        });
+      }
+
+      for (const [key, prior] of byKey.entries()) {
+        if (nextByKey.has(key)) continue;
+        const ageMs = now - prior.lastSeenAt;
+        const ttlMs = (prior.score ?? 0) >= 85 ? 20 * 60_000 : 10 * 60_000;
+        const price = prior.tickerPrice ?? 0;
+        const invalidPrice = price > maxPrice;
+        const stronglyNegative = (prior.changePercent ?? 0) <= -7;
+        if (ageMs > ttlMs || invalidPrice || stronglyNegative) {
+          continue;
+        }
+        nextByKey.set(key, {
+          ...prior,
+          retained: true,
+          retainedReason: "Last valid live signal retained while waiting for next confirmation.",
+          retainedAgeMs: ageMs,
+        });
+      }
+
+      const next = [...nextByKey.values()].sort((a, b) => {
+        const scoreDelta = (b.score ?? 0) - (a.score ?? 0);
+        if (scoreDelta !== 0) return scoreDelta;
+        const changeDelta = (b.changePercent ?? 0) - (a.changePercent ?? 0);
+        if (changeDelta !== 0) return changeDelta;
+        return a.ticker.localeCompare(b.ticker);
+      });
+
+      if (next.length > 0) {
+        lastNonEmptyAlertAtRef.current = now;
+      }
+      return next;
+    });
+
+    const canRetain = (degraded || reconnecting) && lastNonEmptyAlertAtRef.current !== null && now - lastNonEmptyAlertAtRef.current <= 60_000;
+    setFrontendRetained(canRetain);
   }, []);
 
   useEffect(() => {
@@ -61,9 +123,7 @@ export default function HomePage() {
   }, [applySnapshot]);
 
   const alertTape = useMemo(() => {
-    return [...alerts]
-      .filter((alert) => alert.alertType !== "TEST")
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return alerts;
   }, [alerts]);
   const topSignal = alertTape[0] ?? null;
   const statusLine = getStatusLine({ sessionStatus, topSignal, streamConnected });
@@ -71,7 +131,11 @@ export default function HomePage() {
   return (
     <main className="mx-auto max-w-7xl px-5 py-8 text-slate-100">
       <h1 className="text-3xl font-semibold">PulseGrid Live Scanner</h1>
-      <p className="mt-3 text-sm text-slate-300">{statusLine}</p>
+      <p className="mt-3 text-sm text-slate-300">
+        {statusLine}
+        {streamConnected === false ? " Reconnecting..." : ""}
+        {frontendRetained ? " Last live signal retained." : ""}
+      </p>
 
       <section className="mt-8 rounded border border-white/10 p-5">
         <p className="text-xs uppercase tracking-[0.15em] text-slate-400">Top Opportunity</p>
@@ -104,11 +168,14 @@ export default function HomePage() {
               </thead>
               <tbody>
                 {alertTape.map((signal) => (
-                  <tr key={signal.id} className="border-t border-white/10">
+                  <tr key={`${signal.ticker}-${signal.alertType}`} className="border-t border-white/10">
                     <td className="py-2 pr-4 font-semibold">{signal.alertTime}</td>
                     <td className="py-2 pr-4 font-semibold">{signal.ticker}</td>
                     <td className="py-2 pr-4">{signal.alertType}</td>
-                    <td className="py-2 pr-4 text-slate-300">{signal.formattedLine || buildAlertLineFallback(signal)}</td>
+                    <td className="py-2 pr-4 text-slate-300">
+                      {signal.formattedLine || buildAlertLineFallback(signal)}
+                      {signal.retained ? ` · ${Math.floor((signal.retainedAgeMs ?? 0) / 60000)}m ago · retained` : ""}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -119,3 +186,4 @@ export default function HomePage() {
     </main>
   );
 }
+

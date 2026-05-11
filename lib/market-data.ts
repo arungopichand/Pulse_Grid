@@ -139,6 +139,15 @@ export type LiveSessionSnapshot =
         quoteStale: number;
         quoteFailed: number;
         primaryMessages: string[];
+        retainedUniverse?: boolean;
+        retainedUniverseCount?: number;
+        retainedSignalCount?: number;
+        activeSignalMemoryCount?: number;
+        latestSnapshotSignalCount?: number;
+        uiRetentionTtlMs?: number;
+        lastSignalReceivedAt?: string | null;
+        lastNonEmptySignalTimestamp?: string | null;
+        flickerProtectionActive?: boolean;
         scannerThresholds?: {
           minPrice: number;
           maxPrice: number;
@@ -231,6 +240,15 @@ export type LiveSessionSnapshot =
         quoteStale: number;
         quoteFailed: number;
         primaryMessages: string[];
+        retainedUniverse?: boolean;
+        retainedUniverseCount?: number;
+        retainedSignalCount?: number;
+        activeSignalMemoryCount?: number;
+        latestSnapshotSignalCount?: number;
+        uiRetentionTtlMs?: number;
+        lastSignalReceivedAt?: string | null;
+        lastNonEmptySignalTimestamp?: string | null;
+        flickerProtectionActive?: boolean;
         scannerThresholds?: {
           minPrice: number;
           maxPrice: number;

@@ -156,6 +156,9 @@ export type Signal = {
   previousHigh?: number | null;
   previousDayHigh?: number | null;
   formattedLine?: string;
+  retained?: boolean;
+  retainedReason?: string | null;
+  retainedAgeMs?: number | null;
 };
 
 export type WatchlistQuote = WatchlistTicker & {

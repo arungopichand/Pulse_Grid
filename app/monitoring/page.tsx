@@ -22,6 +22,15 @@ type DebugPayload = {
     quoteStale: number;
     quoteFailed: number;
     primaryMessages: string[];
+    retainedUniverse?: boolean;
+    retainedUniverseCount?: number;
+    retainedSignalCount?: number;
+    activeSignalMemoryCount?: number;
+    latestSnapshotSignalCount?: number;
+    uiRetentionTtlMs?: number;
+    lastSignalReceivedAt?: string | null;
+    lastNonEmptySignalTimestamp?: string | null;
+    flickerProtectionActive?: boolean;
     scannerThresholds?: {
       minPrice: number;
       maxPrice: number;
@@ -59,6 +68,7 @@ type DebugPayload = {
       discoveryAttempted: boolean;
       websocketAttempted: boolean;
     };
+    reconnectCount?: number;
   };
   activeSignalsCount: number;
   alertTapeCount?: number;
@@ -193,6 +203,15 @@ export default function MonitoringPage() {
         <div className="rounded border border-white/10 p-3">Last Aggregate At: {payload?.websocket?.lastAggregateAt ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Last Alert At: {payload?.lastAlertAt ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Alerts Count Today: {payload?.alertsCountToday ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">WS Reconnect Count: {payload?.websocket?.reconnectCount ?? "n/a"}</div>
+        <div className="rounded border border-white/10 p-3">Retained Signal Count: {d?.retainedSignalCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Retained Universe Count: {d?.retainedUniverseCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Active Signal Memory Count: {d?.activeSignalMemoryCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">Latest Snapshot Signal Count: {d?.latestSnapshotSignalCount ?? 0}</div>
+        <div className="rounded border border-white/10 p-3">UI Retention TTL (ms): {d?.uiRetentionTtlMs ?? "n/a"}</div>
+        <div className="rounded border border-white/10 p-3">Last Signal Received At: {d?.lastSignalReceivedAt ?? "n/a"}</div>
+        <div className="rounded border border-white/10 p-3">Last Non-empty Signal: {d?.lastNonEmptySignalTimestamp ?? "n/a"}</div>
+        <div className="rounded border border-white/10 p-3">Flicker Protection Active: {String(d?.flickerProtectionActive ?? false)}</div>
       </div>
 
       <section className="mt-6">
