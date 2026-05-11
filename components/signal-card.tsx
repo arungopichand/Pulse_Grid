@@ -1,7 +1,17 @@
 "use client";
 
 import type { Signal } from "@/lib/live-signal-engine";
-import { formatCurrency, formatQuoteFreshness, getSignalStageLabel, quoteFreshnessTone, signalTone } from "@/lib/utils";
+import {
+  formatCurrency,
+  formatQuoteFreshness,
+  getDisplayPriceBucketLabel,
+  getScannerRuleLabel,
+  getSignalStageLabel,
+  priceBucketTone,
+  quoteFreshnessTone,
+  scannerRuleTone,
+  signalTone,
+} from "@/lib/utils";
 
 type SignalCardProps = {
   signal: Signal;
@@ -30,6 +40,8 @@ export function SignalCard({ signal, onClick, featured = false, compact = false,
     timestamp: signal.timestamp,
     quoteFreshness: signal.quoteFreshness,
   });
+  const priceBucketLabel = getDisplayPriceBucketLabel(signal.price, signal.priceBucketLabel);
+  const scannerRuleLabel = getScannerRuleLabel(signal.price);
   const toneClass =
     signal.changePercent >= 0
       ? "text-emerald-300"
@@ -60,12 +72,32 @@ export function SignalCard({ signal, onClick, featured = false, compact = false,
       <p className="mt-3 line-clamp-1 text-sm text-slate-300">{primaryReason}</p>
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
+        <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${priceBucketTone(signal.price)}`}>
+          {priceBucketLabel}
+        </span>
+        <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${scannerRuleTone(signal.price)}`}>
+          {scannerRuleLabel}
+        </span>
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center gap-2">
         <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${signalTone(signal.signalType)}`}>
           {signal.signalType}
         </span>
         <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-200">
           {signal.confidence}
         </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-200">
+          Sev {Math.round(signal.severityScore)}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-200">
+          {signal.signalState}
+        </span>
+        {signal.volumeRatio !== null ? (
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-200">
+            RV {signal.volumeRatio.toFixed(1)}x
+          </span>
+        ) : null}
         <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-200">
           {stage}
         </span>

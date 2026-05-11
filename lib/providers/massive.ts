@@ -70,6 +70,20 @@ export type MassiveIntradayBar = {
   volume: number;
 };
 
+export type MassiveIntradayMetrics = {
+  ticker: string;
+  bars: MassiveIntradayBar[];
+  lastPrice: number | null;
+  oneMinuteChangePercent: number | null;
+  fiveMinuteChangePercent: number | null;
+  sessionVolume: number;
+  greenCandleCount: number;
+  breakoutAboveRecentHigh: boolean;
+  sma5: number | null;
+  sma10: number | null;
+  smaMomentumConfirmed: boolean;
+};
+
 const MASSIVE_BASE_URL = "https://api.massive.com";
 const MASSIVE_STOCK_SNAPSHOT_PATH = "/v2/snapshot/locale/us/markets/stocks/tickers";
 
@@ -284,4 +298,88 @@ export function normalizeMassiveAggregateBars(payload: MassiveAggregateResponse)
     .map(normalizeAggregateBar)
     .filter((bar): bar is MassiveIntradayBar => Boolean(bar))
     .sort((left, right) => new Date(left.datetime).getTime() - new Date(right.datetime).getTime());
+}
+
+function average(values: number[]) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function percentChange(current: number, prior: number) {
+  if (!Number.isFinite(current) || !Number.isFinite(prior) || Math.abs(prior) < 0.000001) {
+    return null;
+  }
+  return ((current - prior) / prior) * 100;
+}
+
+export function computeMassiveIntradayMetrics(ticker: string, bars: MassiveIntradayBar[]): MassiveIntradayMetrics {
+  const normalizedBars = [...bars].sort((left, right) => new Date(left.datetime).getTime() - new Date(right.datetime).getTime());
+  const last = normalizedBars[normalizedBars.length - 1];
+  const fiveAgo = normalizedBars.length >= 6 ? normalizedBars[normalizedBars.length - 6] : null;
+  const oneAgo = normalizedBars.length >= 2 ? normalizedBars[normalizedBars.length - 2] : null;
+  const closes = normalizedBars.map((bar) => bar.close);
+  const recent10 = normalizedBars.slice(-10);
+  const prior9 = recent10.slice(0, -1);
+  const recentSessionVolume = normalizedBars.reduce((sum, bar) => sum + Math.max(0, bar.volume), 0);
+  const greenCandleCount = normalizedBars.slice(-8).filter((bar) => bar.close > bar.open).length;
+  const previousHigh = prior9.length > 0 ? Math.max(...prior9.map((bar) => bar.high)) : null;
+  const sma5 = average(closes.slice(-5));
+  const sma10 = average(closes.slice(-10));
+  const lastPrice = last?.close ?? null;
+  const smaMomentumConfirmed =
+    lastPrice !== null &&
+    sma5 !== null &&
+    sma10 !== null &&
+    lastPrice > sma5 &&
+    sma5 > sma10;
+
+  return {
+    ticker,
+    bars: normalizedBars,
+    lastPrice,
+    oneMinuteChangePercent: last && oneAgo ? percentChange(last.close, oneAgo.close) : null,
+    fiveMinuteChangePercent: last && fiveAgo ? percentChange(last.close, fiveAgo.close) : null,
+    sessionVolume: recentSessionVolume,
+    greenCandleCount,
+    breakoutAboveRecentHigh: previousHigh !== null && last ? last.close > previousHigh : false,
+    sma5,
+    sma10,
+    smaMomentumConfirmed,
+  };
+}
+
+export async function fetchMassiveRecentIntradayForSymbols(
+  tickers: string[],
+  options?: { limit?: number; lookbackMinutes?: number },
+) {
+  const now = Date.now();
+  const lookbackMinutes = Math.max(15, options?.lookbackMinutes ?? 90);
+  const fromMs = now - lookbackMinutes * 60_000;
+  const toMs = now;
+  const limit = Math.max(30, Math.min(500, options?.limit ?? 180));
+
+  const settled = await Promise.allSettled(
+    tickers.map(async (ticker) => {
+      const { response, payload } = await fetchMassiveIntradayAggregates(ticker, {
+        multiplier: 1,
+        timespan: "minute",
+        from: fromMs,
+        to: toMs,
+        adjusted: true,
+        sort: "asc",
+        limit,
+      });
+      if (!response.ok || isMassiveErrorPayload(payload)) {
+        return null;
+      }
+      const bars = normalizeMassiveAggregateBars(payload);
+      if (!bars.length) return null;
+      return computeMassiveIntradayMetrics(ticker, bars);
+    }),
+  );
+
+  return settled
+    .filter((result): result is PromiseFulfilledResult<MassiveIntradayMetrics | null> => result.status === "fulfilled")
+    .map((result) => result.value)
+    .filter((value): value is MassiveIntradayMetrics => Boolean(value));
 }

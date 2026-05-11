@@ -7,11 +7,111 @@ import { formatCurrency, formatQuoteFreshness, formatTime, quoteFreshnessTone, s
 type TickerDetailProps = {
   signal: Signal | null;
   analysis: SignalAnalysis | null;
+  analysisLoading: boolean;
+  analysisError: string | null;
   open: boolean;
   onClose: () => void;
 };
 
-export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailProps) {
+function buildWeakeningLine(signal: Signal, analysis: SignalAnalysis | null) {
+  if (signal.degraded || signal.quoteFreshness === "cached") {
+    return "Fresh quote confirmation staying limited would weaken the read quickly.";
+  }
+
+  if (signal.relativeVolume === null) {
+    return "Weak volume confirmation or a stall in participation would weaken the setup.";
+  }
+
+  if (analysis?.tone === "Fading") {
+    return "Further loss of rank and a flatter tape would weaken this setup.";
+  }
+
+  return "Loss of rank, softer relative volume, or a stall in price expansion would weaken this setup.";
+}
+
+function buildWatchNextChecklist(signal: Signal) {
+  return [
+    signal.topOpportunity ? "See if it holds near the top of the scanner ranks." : "Watch whether it climbs back toward the top ranks.",
+    signal.relativeVolume !== null ? `Check whether RVOL stays firm above ${Math.max(1.5, Math.min(signal.relativeVolume, 2.5)).toFixed(1)}x.` : "Look for cleaner live volume confirmation.",
+    signal.quoteFreshness === "fresh" ? "Monitor whether fresh prints keep confirming the current move." : "Wait for fresh prints to confirm the current tape.",
+    signal.news.hasNews ? "Watch whether the current news context keeps supporting the move." : "Watch whether the move can hold without a news tailwind.",
+  ];
+}
+
+function AnalysisCard({
+  signal,
+  analysis,
+  analysisLoading,
+  analysisError,
+}: {
+  signal: Signal;
+  analysis: SignalAnalysis | null;
+  analysisLoading: boolean;
+  analysisError: string | null;
+}) {
+  const weakeningLine = buildWeakeningLine(signal, analysis);
+  const watchNextItems = buildWatchNextChecklist(signal);
+
+  return (
+    <div className="mt-6 rounded-3xl border border-cyan-300/15 bg-gradient-to-br from-cyan-300/10 to-transparent p-4">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs uppercase tracking-[0.24em] text-slate-500">AI Readout</p>
+        {analysis ? (
+          <span className="rounded-full border border-white/10 px-2 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-400">
+            {analysis.source === "llm" ? "AI-enhanced" : "Rules-backed"}
+          </span>
+        ) : null}
+      </div>
+
+      {analysisLoading ? (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm leading-6 text-slate-200">Generating a grounded readout for this setup.</p>
+          <div className="space-y-2">
+            <div className="h-3 w-full rounded-full bg-white/8" />
+            <div className="h-3 w-5/6 rounded-full bg-white/8" />
+            <div className="h-3 w-2/3 rounded-full bg-white/8" />
+          </div>
+        </div>
+      ) : analysisError ? (
+        <div className="mt-3 rounded-2xl border border-amber-200/15 bg-amber-200/5 p-3 text-sm leading-6 text-amber-100">
+          {analysisError}
+        </div>
+      ) : analysis ? (
+        <>
+          <p className="mt-3 text-sm leading-6 text-slate-100">{analysis.summary}</p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <DetailMetric label="Stage" value={analysis.stage} />
+            <DetailMetric label="Confidence" value={analysis.confidence} />
+            <DetailMetric label="Tone" value={analysis.tone} />
+          </div>
+          <div className="mt-4 space-y-2">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Bull Case</p>
+            <p className="text-sm leading-6 text-slate-200">{analysis.bullCase}</p>
+          </div>
+          <div className="mt-3 space-y-2">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Bear Case</p>
+            <p className="text-sm leading-6 text-slate-200">{analysis.risk}</p>
+          </div>
+          <div className="mt-3 space-y-2">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">What Would Weaken This Setup</p>
+            <p className="text-sm leading-6 text-slate-200">{weakeningLine}</p>
+          </div>
+          <div className="mt-3 space-y-2">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Watch Next</p>
+            <div className="space-y-2">
+              {watchNextItems.map((item) => (
+                <p key={item} className="text-sm leading-6 text-slate-200">{`- ${item}`}</p>
+              ))}
+            </div>
+          </div>
+          <p className="mt-4 text-xs text-slate-400">Interpretation only. It does not generate signals, rankings, or trade advice.</p>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+export function TickerDetail({ signal, analysis, analysisLoading, analysisError, open, onClose }: TickerDetailProps) {
   if (!signal) return null;
 
   return (
@@ -91,26 +191,12 @@ export function TickerDetail({ signal, analysis, open, onClose }: TickerDetailPr
           </div>
         ) : null}
 
-        {analysis ? (
-          <div className="mt-6 rounded-3xl border border-cyan-300/15 bg-gradient-to-br from-cyan-300/10 to-transparent p-4">
-            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">AI Interpretation</p>
-            <p className="mt-3 text-sm leading-6 text-slate-100">{analysis.summary}</p>
-            <div className="mt-4 grid gap-3 sm:grid-cols-3">
-              <DetailMetric label="Stage" value={analysis.stage} />
-              <DetailMetric label="Confidence" value={analysis.confidence} />
-              <DetailMetric label="Tone" value={analysis.tone} />
-            </div>
-            <div className="mt-4 space-y-2">
-              <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Bull Case</p>
-              <p className="text-sm leading-6 text-slate-200">{analysis.bullCase}</p>
-            </div>
-            <div className="mt-3 space-y-2">
-              <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Risk</p>
-              <p className="text-sm leading-6 text-slate-200">{analysis.risk}</p>
-            </div>
-            <p className="mt-4 text-xs text-slate-400">Grounded interpretation only. Not financial advice.</p>
-          </div>
-        ) : null}
+        <AnalysisCard
+          signal={signal}
+          analysis={analysis}
+          analysisLoading={analysisLoading}
+          analysisError={analysisError}
+        />
 
         <div className="mt-6 rounded-3xl border border-accent-blue/15 bg-gradient-to-br from-accent-blue/10 to-transparent p-4">
           <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Score Breakdown</p>

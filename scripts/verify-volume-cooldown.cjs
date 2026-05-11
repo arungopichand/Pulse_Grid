@@ -100,7 +100,7 @@ async function main() {
   Date.now = () => fakeNow;
   process.env.TWELVE_DATA_API_KEY = "verification-key";
 
-  const tickerWithFallback = "AAPL";
+  const tickerWithFallback = "TEST";
   const uncachedTicker = "AMD";
 
   const firstResponse = await callRoute([tickerWithFallback]);

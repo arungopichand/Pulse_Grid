@@ -1,5 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { PersistedActiveNowState } from "./active-now";
+import type { PersistedBotFeedState } from "./bot-feed/store";
 import type { Signal, TickerEvaluationState, WatchlistQuote } from "./live-signal-engine";
 import type { PersistedEventState } from "./live-events";
 import {
@@ -52,6 +54,8 @@ export type PersistedSessionState = {
   recentEvaluations: Record<string, PersistedRecentEvaluation[]>;
   symbolHealth: Record<string, PersistedSymbolHealth>;
   eventState: PersistedEventState;
+  botFeedState: PersistedBotFeedState;
+  activeNowState: PersistedActiveNowState;
   lastUpdated: string | null;
   lastWatchlist: WatchlistQuote[];
   lastSignals: Signal[];
@@ -154,6 +158,13 @@ function createEmptyState(sessionDate: string): PersistedSessionState {
       lastSignalBySymbol: {},
       topSymbol: null,
     },
+    botFeedState: {
+      items: [],
+      lastEmittedAtByKey: {},
+    },
+    activeNowState: {
+      symbols: {},
+    },
     lastUpdated: null,
     lastWatchlist: [],
     lastSignals: [],
@@ -237,6 +248,22 @@ function normalizeStoredState(
           lastSignalBySymbol: {},
           topSymbol: null,
         },
+    activeNowState: stored.activeNowState
+      ? {
+          symbols: stored.activeNowState.symbols ?? {},
+        }
+      : {
+          symbols: {},
+        },
+    botFeedState: stored.botFeedState
+      ? {
+          items: stored.botFeedState.items ?? [],
+          lastEmittedAtByKey: stored.botFeedState.lastEmittedAtByKey ?? {},
+        }
+      : {
+          items: [],
+          lastEmittedAtByKey: {},
+        },
     lastWatchlist: stored.lastWatchlist ?? [],
     lastSignals: stored.lastSignals ?? [],
   };
@@ -291,6 +318,26 @@ function buildComparablePayload(state: PersistedSessionState) {
       )
         .sort()
         .slice(0, 48),
+    },
+    activeNowState: {
+      symbols: Object.fromEntries(
+        Object.entries(state.activeNowState?.symbols ?? {}).map(([ticker, activeNow]) => [
+          ticker,
+          {
+            isActiveNow: activeNow.isActiveNow,
+            lastMeaningfulPushAt: activeNow.lastMeaningfulPushAt,
+            occurrenceCount: activeNow.occurrenceCount,
+            lastLabel: activeNow.lastLabel,
+            lastAlertAt: activeNow.lastAlertAt,
+          },
+        ]),
+      ),
+    },
+    botFeedState: {
+      itemCount: state.botFeedState?.items.length ?? 0,
+      lastTypes: (state.botFeedState?.items ?? []).slice(-12).map((item) => item.type),
+      lastSources: (state.botFeedState?.items ?? []).slice(-12).map((item) => item.source),
+      dedupeKeys: Object.keys(state.botFeedState?.lastEmittedAtByKey ?? {}).sort().slice(0, 64),
     },
     lastSignals: state.lastSignals.map((signal) => ({
       id: signal.id,

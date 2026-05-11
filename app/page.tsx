@@ -1,207 +1,121 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Signal } from "@/lib/live-signal-engine";
 import { fetchLiveSessionSnapshot } from "@/lib/market-data";
+import type { RunnerAlert } from "@/lib/runner-alerts";
 
-function formatChangePercent(value: number) {
-  const sign = value >= 0 ? "+" : "";
-  return `${sign}${value.toFixed(1)}%`;
+function buildAlertLineFallback(alert: RunnerAlert) {
+  const arrow = alert.direction === "up" ? "↑" : alert.direction === "down" ? "↓" : "→";
+  return `${alert.alertTime} ${arrow} ${alert.ticker} ${alert.priceBucket} ${alert.alertType}`;
 }
 
-function formatAge(timestamp: string, nowMs: number) {
-  const ageMs = Math.max(0, nowMs - new Date(timestamp).getTime());
-  const seconds = Math.floor(ageMs / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h`;
-}
-
-function titleCaseSignalType(value: string) {
-  return value.replaceAll("_", " ").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-function DashboardHeader() {
-  return (
-    <header className="border-b border-white/8 pb-6">
-      <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">PulseGrid Lite</p>
-      <h1 className="mt-3 text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">Live Signals</h1>
-    </header>
-  );
-}
-
-function StatusMessage({ text }: { text: string }) {
-  return <p className="mt-4 text-sm text-slate-400">{text}</p>;
-}
-
-function TopOpportunitySection({ signal, nowMs }: { signal: Signal | null; nowMs: number }) {
-  return (
-    <section className="border-r-0 border-white/8 pr-0 pb-8 md:border-r md:pr-8 md:pb-0">
-      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Top Opportunity</p>
-      {!signal ? (
-        <div className="mt-8 space-y-3">
-          <p className="text-2xl font-medium text-slate-100">No active setup yet</p>
-          <p className="text-sm text-slate-400">Waiting for cleaner confirmation from the live feed.</p>
-        </div>
-      ) : (
-        <div className="mt-8">
-          <p className="text-5xl font-semibold tracking-tight text-white">{signal.ticker}</p>
-          <p className="mt-4 text-sm uppercase tracking-[0.14em] text-slate-300">
-            {titleCaseSignalType(signal.signalType)} Signal · Score {Math.round(signal.finalScore)}
-          </p>
-          <div className="mt-8 space-y-3 text-sm">
-            <p className="text-slate-200">{formatChangePercent(signal.changePercent)} today</p>
-            <p className="text-slate-400">
-              {formatAge(signal.timestamp, nowMs)} ago · {signal.quoteProvider === "finnhub" ? "Finnhub" : "Massive"}
-            </p>
-          </div>
-          <div className="mt-8 border-t border-white/8 pt-4">
-            <p className="text-xs uppercase tracking-[0.14em] text-slate-500">Why</p>
-            <p className="mt-2 text-sm leading-relaxed text-slate-300">
-              {signal.explanationLine || "Strong signal strength with fresh momentum confirmation."}
-            </p>
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function LiveSignalsSection({ signals, nowMs }: { signals: Signal[]; nowMs: number }) {
-  return (
-    <section className="md:pl-8">
-      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Live Signals</p>
-      {!signals.length ? (
-        <p className="mt-8 text-sm text-slate-400">No active signals yet.</p>
-      ) : (
-        <div className="mt-5 overflow-x-auto">
-          <table className="w-full min-w-[560px] border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-white/8 text-left text-[11px] uppercase tracking-[0.12em] text-slate-500">
-                <th className="px-0 py-3 font-medium">Symbol</th>
-                <th className="px-3 py-3 font-medium">Signal</th>
-                <th className="px-3 py-3 font-medium">Score</th>
-                <th className="px-3 py-3 font-medium">Change %</th>
-                <th className="px-3 py-3 font-medium">Age</th>
-                <th className="px-3 py-3 font-medium">Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {signals.map((signal) => (
-                <tr key={signal.id} className="border-b border-white/6 text-slate-300">
-                  <td className="px-0 py-3.5 font-semibold text-slate-100">{signal.ticker}</td>
-                  <td className="px-3 py-3.5">{titleCaseSignalType(signal.signalType)}</td>
-                  <td className="px-3 py-3.5">{Math.round(signal.finalScore)}</td>
-                  <td className={`px-3 py-3.5 ${signal.changePercent >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
-                    {formatChangePercent(signal.changePercent)}
-                  </td>
-                  <td className="px-3 py-3.5 text-slate-400">{formatAge(signal.timestamp, nowMs)} ago</td>
-                  <td className="px-3 py-3.5 text-slate-400">{signal.quoteProvider === "finnhub" ? "Finnhub" : "Massive"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
+function getStatusLine(params: {
+  sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
+  topSignal: RunnerAlert | null;
+  streamConnected: boolean | null;
+}) {
+  if (params.sessionStatus === "closed") {
+    return "Market is closed. Scanner will monitor pre-market activity when available.";
+  }
+  if (params.streamConnected === false) {
+    return "Live stream is reconnecting. Waiting for fresh market data.";
+  }
+  if (params.topSignal) {
+    return `${params.topSignal.ticker} is leading with fresh momentum confirmation.`;
+  }
+  return "Scanner is live. Waiting for qualifying <$10 momentum setups.";
 }
 
 export default function HomePage() {
-  const [signals, setSignals] = useState<Signal[]>([]);
-  const [degraded, setDegraded] = useState(false);
+  const [alerts, setAlerts] = useState<RunnerAlert[]>([]);
   const [sessionStatus, setSessionStatus] = useState<"premarket" | "regular" | "after-hours" | "closed">("closed");
-  const [nowTick, setNowTick] = useState(() => Date.now());
+  const [streamConnected, setStreamConnected] = useState<boolean | null>(null);
 
   const applySnapshot = useCallback((result: Awaited<ReturnType<typeof fetchLiveSessionSnapshot>>) => {
-    setSignals(result.signals);
-    setDegraded(result.degraded);
+    setAlerts(result.alerts ?? []);
     setSessionStatus(result.sessionStatus);
+    setStreamConnected(result.streamHealth?.connected ?? null);
   }, []);
 
   useEffect(() => {
     let active = true;
-    let controller: AbortController | null = new AbortController();
     let eventSource: EventSource | null = null;
 
     const bootstrap = async () => {
-      try {
-        const result = await fetchLiveSessionSnapshot({ signal: controller?.signal });
-        if (!active) return;
-        applySnapshot(result);
-      } catch (error) {
-        if (error instanceof Error && error.name === "AbortError") return;
-        if (!active) return;
-        setDegraded(true);
-        setSignals([]);
-      }
-
+      const result = await fetchLiveSessionSnapshot();
       if (!active) return;
+      applySnapshot(result);
       eventSource = new EventSource("/api/live-session/events");
       eventSource.addEventListener("snapshot", (event) => {
         if (!active) return;
-        const result = JSON.parse((event as MessageEvent<string>).data) as Awaited<ReturnType<typeof fetchLiveSessionSnapshot>>;
-        applySnapshot(result);
+        const payload = JSON.parse((event as MessageEvent<string>).data) as Awaited<ReturnType<typeof fetchLiveSessionSnapshot>>;
+        applySnapshot(payload);
       });
     };
 
     void bootstrap();
-
     return () => {
       active = false;
-      controller?.abort();
-      controller = null;
       eventSource?.close();
     };
   }, [applySnapshot]);
 
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      setNowTick(Date.now());
-    }, 1000);
-    return () => window.clearInterval(interval);
-  }, []);
-
-  const rankedSignals = useMemo(() => {
-    return [...signals].sort((left, right) => {
-      if (right.finalScore !== left.finalScore) {
-        return right.finalScore - left.finalScore;
-      }
-      return right.confidenceScore - left.confidenceScore;
-    });
-  }, [signals]);
-
-  const topOpportunity = rankedSignals[0] ?? null;
-  const statusLine =
-    sessionStatus === "closed"
-      ? "Scanner online - market closed. Waiting for pre-market activity."
-      : sessionStatus === "premarket"
-        ? topOpportunity
-          ? `${topOpportunity.ticker} is leading with fresh momentum confirmation.`
-          : "Pre-market monitoring - scanner online but waiting for activity."
-        : sessionStatus === "after-hours"
-          ? topOpportunity
-            ? `${topOpportunity.ticker} is leading with fresh momentum confirmation.`
-            : "After-hours monitoring - scanner online but waiting for activity."
-          : degraded
-            ? "Live signals are updating from a limited backend cycle."
-            : topOpportunity
-              ? `${topOpportunity.ticker} is leading with fresh momentum confirmation.`
-              : "Monitoring active symbols for fresh momentum.";
+  const alertTape = useMemo(() => {
+    return [...alerts]
+      .filter((alert) => alert.alertType !== "TEST")
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }, [alerts]);
+  const topSignal = alertTape[0] ?? null;
+  const statusLine = getStatusLine({ sessionStatus, topSignal, streamConnected });
 
   return (
-    <main className="relative overflow-hidden">
-      <div className="absolute inset-0 grid-overlay opacity-[0.08]" />
-      <div className="relative mx-auto min-h-screen w-full max-w-7xl px-5 pt-10 pb-10 sm:px-8 lg:px-10">
-        <DashboardHeader />
-        <StatusMessage text={statusLine} />
-        <div className="mt-10 grid grid-cols-1 gap-10 md:grid-cols-[minmax(0,38fr)_minmax(0,62fr)] md:gap-0">
-          <TopOpportunitySection signal={topOpportunity} nowMs={nowTick} />
-          <LiveSignalsSection signals={rankedSignals} nowMs={nowTick} />
-        </div>
-      </div>
+    <main className="mx-auto max-w-7xl px-5 py-8 text-slate-100">
+      <h1 className="text-3xl font-semibold">PulseGrid Live Scanner</h1>
+      <p className="mt-3 text-sm text-slate-300">{statusLine}</p>
+
+      <section className="mt-8 rounded border border-white/10 p-5">
+        <p className="text-xs uppercase tracking-[0.15em] text-slate-400">Top Opportunity</p>
+        {topSignal ? (
+          <div className="mt-4">
+            <p className="text-4xl font-semibold">{topSignal.ticker}</p>
+            <p className="mt-2 text-sm text-slate-300">
+              {topSignal.formattedLine ?? buildAlertLineFallback(topSignal)}
+            </p>
+          </div>
+        ) : (
+          <p className="mt-4 text-sm text-slate-400">No active setup yet.</p>
+        )}
+      </section>
+
+      <section className="mt-8">
+        <p className="text-xs uppercase tracking-[0.15em] text-slate-400">Live Alert Tape</p>
+        {alertTape.length === 0 ? (
+          <p className="mt-4 text-sm text-slate-400">No active signals yet.</p>
+        ) : (
+          <div className="mt-4 overflow-x-auto">
+            <table className="min-w-[760px] text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase text-slate-400">
+                  <th className="pr-4">Time</th>
+                  <th className="pr-4">Symbol</th>
+                  <th className="pr-4">Signal</th>
+                  <th className="pr-4">Alert</th>
+                </tr>
+              </thead>
+              <tbody>
+                {alertTape.map((signal) => (
+                  <tr key={signal.id} className="border-t border-white/10">
+                    <td className="py-2 pr-4 font-semibold">{signal.alertTime}</td>
+                    <td className="py-2 pr-4 font-semibold">{signal.ticker}</td>
+                    <td className="py-2 pr-4">{signal.alertType}</td>
+                    <td className="py-2 pr-4 text-slate-300">{signal.formattedLine || buildAlertLineFallback(signal)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </main>
   );
 }

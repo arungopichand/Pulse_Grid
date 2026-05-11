@@ -18,9 +18,12 @@ import {
   getDynamicUniverse as getDynamicUniverseFromStream,
   getMarketSnapshot,
   getMarketStreamHealth,
+  getSymbolIntradayState,
   getVolumeSnapshotsForSymbols,
   startMarketStream,
 } from "./market-stream";
+import { getMassiveApiKey } from "./providers/massive";
+import type { RunnerAlert } from "./runner-alerts";
 import type { WatchlistTicker } from "./watchlist";
 
 const LIVE_SESSION_FAST_LANE_VOLUME_COUNT = 4;
@@ -91,22 +94,52 @@ const liveStateStore: SharedLiveStateStore = {
 
 let persistedState: PersistedSessionState | null = null;
 let latestPersistenceStatus: PersistenceStatus | null = null;
+let alertMemorySessionDate: string | null = null;
 let cyclePromise: Promise<LiveSessionSnapshot> | null = null;
 let nextCycleTimer: ReturnType<typeof setTimeout> | null = null;
 let lastDemandAt = 0;
 let cachedUniverseCandidates: WatchlistTicker[] = [];
 let cachedUniverseDiscovery: {
-  source: "live" | "cache" | "fallback_empty" | "fallback_default";
+  source: "live" | "cache" | "fallback_empty";
   discoveredCount: number;
+  discoveredBeforeFilters: number;
   selectedCount: number;
   topSymbols: string[];
   reasonsBySymbol: Record<string, string>;
+  scannerThresholds: {
+    minPrice: number;
+    maxPrice: number;
+    minVolume: number;
+    minRelativeVolume: number;
+    minAbsChangePercent: number;
+    bullishOnly: boolean;
+  };
+  rejectionReasonCounts: Record<string, number>;
+  topCandidates: Array<{
+    ticker: string;
+    price: number;
+    changePercent: number;
+    currentVolume: number;
+    relativeVolume: number | null;
+    reason: string;
+  }>;
 } = {
   source: "fallback_empty",
   discoveredCount: 0,
+  discoveredBeforeFilters: 0,
   selectedCount: 0,
   topSymbols: [],
   reasonsBySymbol: {},
+  scannerThresholds: {
+    minPrice: 0.1,
+    maxPrice: 20,
+    minVolume: 0,
+    minRelativeVolume: 0,
+    minAbsChangePercent: 0,
+    bullishOnly: false,
+  },
+  rejectionReasonCounts: {},
+  topCandidates: [],
 };
 let nextUniverseRefreshAt = 0;
 let cachedNewsByTicker = new Map<string, StructuredNewsSnapshot>();
@@ -121,28 +154,100 @@ const STRONG_BREAKOUT_CHANGE = 2;
 const NORMAL_SIGNAL_TTL_MS = 10 * 60 * 1000;
 const STRONG_SIGNAL_TTL_MS = 20 * 60 * 1000;
 const SIGNAL_MEMORY_RETENTION_MS = 6 * 60 * 60 * 1000;
+const RUNNER_ALERT_MIN_REPEAT_MS = 3 * 60_000;
 
-type SignalMemory = {
-  symbol: string;
-  lastSignalType: string;
-  lastScore: number;
-  lastChangePercent: number;
+type RunnerAlertState = {
+  ticker: string;
+  sessionDate: string;
+  alertCountToday: number;
+  dayHigh: number | null;
+  sessionHigh: number | null;
+  previousDayHigh: number | null;
+  previousSessionHigh: number | null;
+  lastAlertPrice: number | null;
+  lastAlertHigh: number | null;
+  lastAlertType: RunnerAlert["alertType"] | null;
+  lastAlertAt: number | null;
+  lastAlertScore: number | null;
+  lastVolume: number | null;
+  lastRelativeVolume: number | null;
+  lastFormattedLine: string | null;
+};
+
+const runnerAlertStateByTicker = new Map<string, RunnerAlertState>();
+const suppressedDuplicateAlerts: Array<{ time: string; ticker: string; alertType: RunnerAlert["alertType"]; reason: string }> = [];
+const transitionLog: Array<{
+  time: string;
+  ticker: string;
+  previousDayHigh: number | null;
+  newDayHigh: number | null;
+  previousSessionHigh: number | null;
+  newSessionHigh: number | null;
+  alertType: RunnerAlert["alertType"];
+  emitted: boolean;
+  suppressedReason: string | null;
+}> = [];
+
+function getPriceBucket(price: number) {
+  if (price < 0.15) return "< $.15c";
+  if (price < 0.5) return "< $.50c";
+  if (price < 1) return "< $1";
+  if (price < 2) return "< $2";
+  if (price < 3) return "< $3";
+  if (price < 5) return "< $5";
+  if (price < 8) return "< $8";
+  if (price < 10) return "< $10";
+  return `< $${Math.ceil(price)}`;
+}
+
+function compactVolume(value: number | null) {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  if (value >= 1_000_000) {
+    const m = value / 1_000_000;
+    return m >= 100 ? `${Math.round(m)}M` : `${Math.round(m * 10) / 10}M`;
+  }
+  if (value >= 1_000) return `${Math.round(value / 100) / 10}k`;
+  return `${Math.round(value)}`;
+}
+
+function compactRvol(value: number | null) {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  if (value >= 1000) return `${Math.round(value).toLocaleString("en-US")}x`;
+  if (value >= 10) return `${Math.round(value)}x`;
+  return `${Math.round(value * 10) / 10}x`;
+}
+
+function compactMoney(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  if (value >= 1_000_000_000) return `${Math.round((value / 1_000_000_000) * 10) / 10}B`;
+  if (value >= 1_000_000) return `${Math.round((value / 1_000_000) * 10) / 10}M`;
+  if (value >= 1_000) return `${Math.round((value / 1_000) * 10) / 10}k`;
+  return `${Math.round(value)}`;
+}
+
+type SignalEventType =
+  | "MOMENTUM_BREAKOUT"
+  | "NEW_HOD"
+  | "SHARP_FALL"
+  | "NEW_LOD"
+  | "VOLUME_SPIKE"
+  | "CONTINUATION";
+
+type AlertMemory = {
+  ticker: string;
+  sequence: number;
   lastAlertAt: number;
+  lastAlertType: SignalEventType;
+  lastScore: number;
+  lastPrice: number;
+  lastDayHigh: number | null;
+  lastDayLow: number | null;
+  lastDirection: "UP" | "DOWN";
   lastSeenAt: number;
-  lastBreakoutKey: string;
   lastEmittedSignal: Signal;
 };
 
-const signalMemoryBySymbol = new Map<string, SignalMemory>();
-
-function buildBreakoutKey(signal: Signal) {
-  return [
-    signal.ticker,
-    signal.signalType,
-    Math.round(signal.finalScore),
-    Math.round(signal.changePercent * 10),
-  ].join("|");
-}
+const signalMemoryBySymbol = new Map<string, AlertMemory>();
 
 function getSignalReason(signal: Signal) {
   if (signal.reason && signal.reason.trim().length > 0) return signal.reason;
@@ -181,23 +286,86 @@ function isActionableMomentum(candidate: Signal) {
   return score >= MIN_ACTIONABLE_SCORE && Math.abs(change) >= MIN_ACTIONABLE_CHANGE;
 }
 
-function shouldEmitSignal(candidate: Signal, memory: SignalMemory | undefined, nowMs: number) {
-  const score = Number(candidate.finalScore ?? candidate.score ?? 0);
-  const signalType = String(candidate.signalType ?? "UNKNOWN");
-  const change = Number(candidate.changePercent ?? 0);
+function getEventLabel(eventType: SignalEventType) {
+  switch (eventType) {
+    case "MOMENTUM_BREAKOUT":
+      return "Momentum Breakout";
+    case "NEW_HOD":
+      return "New High Of Day";
+    case "SHARP_FALL":
+      return "Sharp Fall";
+    case "NEW_LOD":
+      return "New Low Of Day";
+    case "VOLUME_SPIKE":
+      return "Volume Spike";
+    case "CONTINUATION":
+      return "Continuation";
+  }
+}
 
+function detectSignalEventType(candidate: Signal): SignalEventType | null {
+  const intraday = getSymbolIntradayState(candidate.ticker);
+  if (!intraday) {
+    return null;
+  }
+
+  const price = Number(candidate.price ?? intraday.lastPrice ?? 0);
+  const change = Number(candidate.changePercent ?? 0);
+  const score = Number(candidate.finalScore ?? candidate.score ?? 0);
+  const prevHigh = intraday.previousMinuteHigh;
+  const prevLow = intraday.previousMinuteLow;
+
+  const brokePrevHigh = typeof prevHigh === "number" && prevHigh > 0 && price > prevHigh;
+  const brokePrevLow = typeof prevLow === "number" && prevLow > 0 && price < prevLow;
+  const brokeDayHigh = typeof intraday.dayHigh === "number" && intraday.dayHigh > 0 && price > intraday.dayHigh;
+  const brokeDayLow = typeof intraday.dayLow === "number" && intraday.dayLow > 0 && price < intraday.dayLow;
+  const volumeSpike =
+    typeof intraday.currentMinuteVolume === "number" &&
+    typeof intraday.previousMinuteVolume === "number" &&
+    intraday.previousMinuteVolume > 0 &&
+    intraday.currentMinuteVolume >= intraday.previousMinuteVolume * 1.5;
+
+  if (brokeDayHigh && change >= 1) return "NEW_HOD";
+  if (brokeDayLow && change <= -1) return "NEW_LOD";
+  if (brokePrevHigh && change >= 1 && score >= 70) return "MOMENTUM_BREAKOUT";
+  if (brokePrevLow && change <= -1) return "SHARP_FALL";
+  if (volumeSpike && Math.abs(change) >= 1) return "VOLUME_SPIKE";
+  if (Math.abs(change) >= 1 && score >= 70) return "CONTINUATION";
+
+  return null;
+}
+
+function shouldEmitSignal(candidate: Signal, memory: AlertMemory | undefined, nowMs: number, eventType: SignalEventType) {
   if (!memory) return true;
 
-  const elapsed = nowMs - memory.lastAlertAt;
-  const sameSignalType = memory.lastSignalType === signalType;
-  const scoreImproved = score >= Number(memory.lastScore ?? 0) + SCORE_REENTRY_DELTA;
-  const changeExpanded = Math.abs(change) >= Math.abs(Number(memory.lastChangePercent ?? 0)) + CHANGE_REENTRY_DELTA;
-  const cooldownExpired = elapsed >= SIGNAL_COOLDOWN_MS;
+  const score = Number(candidate.finalScore ?? candidate.score ?? 0);
+  const change = Number(candidate.changePercent ?? 0);
+  const direction: "UP" | "DOWN" = change >= 0 ? "UP" : "DOWN";
+  const priceBreak = memory.lastPrice > 0 ? Math.abs((candidate.price - memory.lastPrice) / memory.lastPrice) * 100 : 0;
+  const scoreImproved = score >= memory.lastScore + SCORE_REENTRY_DELTA;
+  const changeExpanded = Math.abs(change) >= Math.abs(memory.lastEmittedSignal.changePercent ?? 0) + CHANGE_REENTRY_DELTA;
+  const directionChanged = direction !== memory.lastDirection;
+  const eventTypeChanged = eventType !== memory.lastAlertType;
+  const cooldownExpired = nowMs - memory.lastAlertAt >= SIGNAL_COOLDOWN_MS;
+  const strongPriceBreak = priceBreak >= 0.75;
+  const intraday = getSymbolIntradayState(candidate.ticker);
+  const strongVolumeExpansion =
+    Boolean(
+      intraday &&
+      typeof intraday.currentMinuteVolume === "number" &&
+      typeof intraday.previousMinuteVolume === "number" &&
+      intraday.previousMinuteVolume > 0 &&
+      intraday.currentMinuteVolume >= intraday.previousMinuteVolume * 1.5,
+    );
 
-  if (!sameSignalType) return true;
+  if (eventType === "NEW_HOD" || eventType === "NEW_LOD") return true;
+  if (eventTypeChanged) return true;
   if (scoreImproved) return true;
   if (changeExpanded) return true;
-  if (cooldownExpired && score >= MIN_ACTIONABLE_SCORE) return true;
+  if (strongPriceBreak) return true;
+  if (directionChanged) return true;
+  if (strongVolumeExpansion) return true;
+  if (cooldownExpired) return true;
 
   return false;
 }
@@ -207,22 +375,43 @@ function getSignalTtlMs(signal: Signal) {
   return score >= STRONG_BREAKOUT_SCORE ? STRONG_SIGNAL_TTL_MS : NORMAL_SIGNAL_TTL_MS;
 }
 
-function rememberEmittedSignal(signal: Signal, nowMs: number) {
-  const symbol = signal.ticker;
+function buildEventExplanation(signal: Signal, eventType: SignalEventType, sequence: number, hasVolume: boolean) {
+  const prefix = `${signal.ticker} #${sequence}:`;
+  if (eventType === "NEW_HOD") return `${prefix} new high of day after earlier alert.`;
+  if (eventType === "NEW_LOD") return `${prefix} new low of day with downside continuation.`;
+  if (eventType === "SHARP_FALL") return `${prefix} sharp downside move below previous candle low.`;
+  if (eventType === "VOLUME_SPIKE" && hasVolume) return `${prefix} volume spike with aligned price expansion.`;
+  if (eventType === "CONTINUATION") return `${prefix} continuation with stronger move than prior alert.`;
+  return `${prefix} first momentum breakout${hasVolume ? " with strong relative volume." : "."}`;
+}
+
+function rememberEmittedSignal(signal: Signal, nowMs: number, eventType: SignalEventType) {
+  const memory = signalMemoryBySymbol.get(signal.ticker);
+  const sequence = (memory?.sequence ?? 0) + 1;
+  const intraday = getSymbolIntradayState(signal.ticker);
+  const hasVolume = typeof signal.relativeVolume === "number" || (typeof signal.currentVolume === "number" && typeof signal.averageVolume === "number");
   const nextSignal: Signal = {
     ...signal,
+    alertSequence: sequence,
+    eventType,
+    eventLabel: getEventLabel(eventType),
+    emittedAt: new Date(nowMs).toISOString(),
+    source: "Massive",
     reason: getSignalReason(signal),
-    explanationLine: signal.explanationLine || getSignalReason(signal),
+    explanationLine: buildEventExplanation(signal, eventType, sequence, hasVolume),
   };
 
-  signalMemoryBySymbol.set(symbol, {
-    symbol,
-    lastSignalType: String(signal.signalType ?? "UNKNOWN"),
-    lastScore: Number(signal.finalScore ?? signal.score ?? 0),
-    lastChangePercent: Number(signal.changePercent ?? 0),
+  signalMemoryBySymbol.set(signal.ticker, {
+    ticker: signal.ticker,
+    sequence,
     lastAlertAt: nowMs,
+    lastAlertType: eventType,
+    lastScore: Number(signal.finalScore ?? signal.score ?? 0),
+    lastPrice: Number(signal.price ?? 0),
+    lastDayHigh: intraday?.dayHigh ?? null,
+    lastDayLow: intraday?.dayLow ?? null,
+    lastDirection: (signal.changePercent ?? 0) >= 0 ? "UP" : "DOWN",
     lastSeenAt: nowMs,
-    lastBreakoutKey: buildBreakoutKey(signal),
     lastEmittedSignal: nextSignal,
   });
 }
@@ -251,11 +440,27 @@ function collectActiveSignalsFromMemory(nowMs: number) {
   }
 
   activeSignals.sort((left, right) => {
+    const leftRecent = left.emittedAt ? new Date(left.emittedAt).getTime() : new Date(left.timestamp).getTime();
+    const rightRecent = right.emittedAt ? new Date(right.emittedAt).getTime() : new Date(right.timestamp).getTime();
+    if (rightRecent !== leftRecent) {
+      return rightRecent - leftRecent;
+    }
+
+    if (right.confidenceScore !== left.confidenceScore) {
+      return right.confidenceScore - left.confidenceScore;
+    }
+
     if (right.finalScore !== left.finalScore) {
       return right.finalScore - left.finalScore;
     }
 
-    return right.confidenceScore - left.confidenceScore;
+    const rightSeq = right.alertSequence ?? 0;
+    const leftSeq = left.alertSequence ?? 0;
+    if (rightSeq !== leftSeq) {
+      return rightSeq - leftSeq;
+    }
+
+    return Math.abs(right.changePercent) - Math.abs(left.changePercent);
   });
 
   return activeSignals;
@@ -625,6 +830,10 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   const startedAt = Date.now();
   const runtimeConfig = getSignalRuntimeConfig();
   const marketClock = getMarketClock();
+  if (alertMemorySessionDate !== marketClock.sessionDate) {
+    signalMemoryBySymbol.clear();
+    alertMemorySessionDate = marketClock.sessionDate;
+  }
   console.log("[live-session-runtime] heartbeat ok", {
     sessionStatus: marketClock.sessionStatus,
     sessionLabel: marketClock.label,
@@ -638,9 +847,13 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     cachedUniverseDiscovery = {
       source: dynamicUniverse.source,
       discoveredCount: dynamicUniverse.discoveredCount,
+      discoveredBeforeFilters: dynamicUniverse.discoveredBeforeFilters,
       selectedCount: dynamicUniverse.selectedCount,
       topSymbols: dynamicUniverse.topSymbols,
       reasonsBySymbol: dynamicUniverse.reasonsBySymbol,
+      scannerThresholds: dynamicUniverse.scannerThresholds,
+      rejectionReasonCounts: dynamicUniverse.rejectionReasonCounts,
+      topCandidates: dynamicUniverse.topCandidates,
     };
     nextUniverseRefreshAt = Date.now() + runtimeConfig.universeRefreshMs;
   }
@@ -727,6 +940,51 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     staleAfterMs: quotesResult.staleAfterMs,
     refreshBatchSize: quotesResult.refreshBatchSize,
   };
+  const massiveApiKeyConfigured = Boolean(getMassiveApiKey());
+  const noQualifyingSymbols = activeTickers.length === 0;
+  const hasAnyQuotes = quotesResult.summary.fresh + quotesResult.summary.cached + quotesResult.summary.stale > 0;
+  const primaryMessages: string[] = [];
+  if (!massiveApiKeyConfigured) {
+    primaryMessages.push("Massive API key is missing.");
+  }
+  if (noQualifyingSymbols) {
+    primaryMessages.push("No qualifying momentum symbols right now.");
+    if (marketClock.sessionStatus === "premarket") {
+      primaryMessages.push("Massive movers empty; premarket data may not have populated yet.");
+    }
+  }
+  if (!streamHealth.connected) {
+    primaryMessages.push("WebSocket disconnected.");
+  }
+  if (streamHealth.wsMessagesReceived > 0 && streamHealth.wsUpdatesApplied === 0) {
+    primaryMessages.push("WebSocket connected but no trade ticks received.");
+  }
+  if (primaryMessages.length === 0) {
+    primaryMessages.push("Scanner is live.");
+  }
+  const scannerDiagnostics = {
+    massiveApiKeyConfigured,
+    universeSource: cachedUniverseDiscovery.source,
+    activeUniverseCount: activeTickers.length,
+    discoveredCount: cachedUniverseDiscovery.discoveredCount,
+    discoveredBeforeFilters: cachedUniverseDiscovery.discoveredBeforeFilters,
+    selectedCount: cachedUniverseDiscovery.selectedCount,
+    noQualifyingSymbols,
+    websocketConnected: streamHealth.connected,
+    websocketAuthenticated: streamHealth.authenticated ?? null,
+    websocketSubscribedCount: streamHealth.subscribedSymbolCount,
+    websocketMessagesReceived: streamHealth.wsMessagesReceived,
+    websocketUpdatesApplied: streamHealth.wsUpdatesApplied,
+    websocketDegradedReason: streamHealth.degradedReason ?? null,
+    quoteFresh: quotesResult.summary.fresh,
+    quoteCached: quotesResult.summary.cached,
+    quoteStale: quotesResult.summary.stale,
+    quoteFailed: quotesResult.summary.failed,
+    primaryMessages,
+    scannerThresholds: cachedUniverseDiscovery.scannerThresholds,
+    rejectionReasonCounts: { ...cachedUniverseDiscovery.rejectionReasonCounts },
+    topCandidates: cachedUniverseDiscovery.topCandidates,
+  } satisfies NonNullable<LiveSessionSnapshot["scannerDiagnostics"]>;
 
   const generatedAt = new Date().toISOString();
   const generatedAtMs = new Date(generatedAt).getTime();
@@ -750,13 +1008,18 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
   for (const candidate of evaluation.signals) {
     const symbol = candidate.ticker;
     const memory = signalMemoryBySymbol.get(symbol);
+    const eventType = detectSignalEventType(candidate);
 
     if (!isActionableMomentum(candidate)) {
       updateSeenSignal(symbol, generatedAtMs);
       continue;
     }
+    if (!eventType) {
+      updateSeenSignal(symbol, generatedAtMs);
+      continue;
+    }
 
-    if (!shouldEmitSignal(candidate, memory, generatedAtMs)) {
+    if (!shouldEmitSignal(candidate, memory, generatedAtMs, eventType)) {
       updateSeenSignal(symbol, generatedAtMs);
       console.log("[live-session-runtime] signal suppressed by cooldown", {
         symbol,
@@ -767,11 +1030,13 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       continue;
     }
 
-    rememberEmittedSignal(candidate, generatedAtMs);
+    rememberEmittedSignal(candidate, generatedAtMs, eventType);
+    const remembered = signalMemoryBySymbol.get(symbol);
+    if (!remembered) {
+      continue;
+    }
     cycleEmittedSignals.push({
-      ...candidate,
-      reason: getSignalReason(candidate),
-      explanationLine: candidate.explanationLine || getSignalReason(candidate),
+      ...remembered.lastEmittedSignal,
     });
     console.log("[live-session-runtime] signal emitted", {
       symbol,
@@ -781,11 +1046,363 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     });
   }
   const activeSignals = collectActiveSignalsFromMemory(generatedAtMs);
+  if (hasAnyQuotes && activeSignals.length === 0) {
+    const liveQuotesNoSignalMessage = "Live quotes available but no signal passed momentum filters.";
+    if (!scannerDiagnostics.primaryMessages.includes(liveQuotesNoSignalMessage)) {
+      scannerDiagnostics.primaryMessages.push(liveQuotesNoSignalMessage);
+    }
+  }
+  if (
+    scannerDiagnostics.primaryMessages.length === 1 &&
+    scannerDiagnostics.primaryMessages[0] === "Scanner is live." &&
+    hasAnyQuotes &&
+    activeSignals.length === 0
+  ) {
+    scannerDiagnostics.primaryMessages.shift();
+  }
   if (cycleEmittedSignals.length === 0) {
     console.log("[live-session-runtime] no actionable momentum this cycle");
   }
 
   const volumeByTicker = new Map(volumeResult.snapshots.map((snapshot) => [snapshot.ticker, snapshot]));
+  const activeSignalByTicker = new Map(activeSignals.map((signal) => [signal.ticker, signal]));
+  const volumeSpikeOnlyCandidates = evaluation.watchlist
+    .filter((item) => !activeSignalByTicker.has(item.ticker))
+    .filter((item) => item.freshness === "fresh" || item.freshness === "cached")
+    .map((item) => {
+      const meta = activeUniverse.find((ticker) => ticker.ticker === item.ticker);
+      const volume = volumeByTicker.get(item.ticker);
+      const price = item.price;
+      const changePercent = item.changePercent;
+      if (!meta || price === null || changePercent === null) return null;
+      return ({
+        id: `volume-spike-only-${item.ticker}-${item.timestamp ?? generatedAt}`,
+        ticker: item.ticker,
+        company: meta.company,
+        signalType: "VOLUME_BREAKOUT" as const,
+        severityScore: 0,
+        signalState: "active" as const,
+        price,
+        timestamp: item.timestamp ?? generatedAt,
+        confidence: "MEDIUM" as const,
+        confidenceScore: 0,
+        reason: "Volume spike candidate from live watchlist.",
+        reasons: ["volume_spike_candidate"],
+        changePercent,
+        quoteFreshness: item.freshness as "fresh" | "cached",
+        quoteProvider: item.quoteProvider ?? "massive",
+        degraded: false,
+        sector: meta.sector,
+        exchange: meta.exchange,
+        countryCode: meta.country,
+        instrumentType: meta.instrumentType,
+        tags: [],
+        score: 0,
+        finalScore: 0,
+        scoreBreakdown: { momentumScore: 0, volumeScore: 0, newsScore: 0, trendScore: 0, finalScore: 0 },
+        factors: { strongMove: changePercent > 0, volumeSpike: true, news: false, trending: false },
+        factorCount: 1,
+        newsSentiment: "none" as const,
+        news: {
+          availability: "unavailable" as const,
+          hasNews: false,
+          bullishNews: false,
+          bearishNews: false,
+          sentimentScore: null,
+          bullishPercent: null,
+          bearishPercent: null,
+          headline: null,
+          source: null,
+          publishedAt: null,
+          provider: null,
+        },
+        topOpportunity: false,
+        reasonBadges: [],
+        relativeVolume:
+          volume && volume.averageVolume > 0
+            ? volume.currentVolume / volume.averageVolume
+            : null,
+        currentVolume: volume?.currentVolume ?? null,
+        averageVolume: volume?.averageVolume ?? null,
+        streakCount: 1,
+        sourceData: ["massive"],
+        volumeRatio:
+          volume && volume.averageVolume > 0
+            ? volume.currentVolume / volume.averageVolume
+            : null,
+        freezeSeconds: 0,
+        reappearance: {
+          isReappearing: false,
+          strongerReappearance: false,
+          label: null,
+          scoreBoost: 0,
+          lastSeenAt: null,
+          lastScore: null,
+          lastRank: null,
+        },
+        floatShares: meta.floatShares ?? null,
+        alertSummary: "",
+        explanationLine: "",
+        primaryPatternLabel: "momentum-build" as const,
+        secondaryReasonLabel: null,
+        occurrenceCount: 1,
+        sequenceLabel: null,
+        priceBucketLabel: "",
+        volume: volume?.currentVolume ?? null,
+        themeTags: [],
+        specialTags: [],
+        haltStatus: "active" as const,
+        riskFlags: [],
+      } as unknown as Signal);
+    })
+    .filter(Boolean) as Signal[];
+
+  const alerts: RunnerAlert[] = [];
+  for (const signal of [...activeSignals, ...volumeSpikeOnlyCandidates]) {
+    const prior = runnerAlertStateByTicker.get(signal.ticker) ?? {
+      ticker: signal.ticker,
+      sessionDate: marketClock.sessionDate,
+      alertCountToday: 0,
+      dayHigh: null,
+      sessionHigh: null,
+      previousDayHigh: null,
+      previousSessionHigh: null,
+      lastAlertPrice: null,
+      lastAlertHigh: null,
+      lastAlertType: null,
+      lastAlertAt: null,
+      lastAlertScore: null,
+      lastVolume: null,
+      lastRelativeVolume: null,
+      lastFormattedLine: null,
+    };
+    if (prior.sessionDate !== marketClock.sessionDate) {
+      prior.alertCountToday = 0;
+      prior.dayHigh = null;
+      prior.sessionHigh = null;
+      prior.previousDayHigh = null;
+      prior.previousSessionHigh = null;
+      prior.lastAlertPrice = null;
+      prior.lastAlertHigh = null;
+      prior.lastAlertType = null;
+      prior.lastAlertAt = null;
+      prior.lastAlertScore = null;
+      prior.lastVolume = null;
+      prior.lastRelativeVolume = null;
+      prior.lastFormattedLine = null;
+      prior.sessionDate = marketClock.sessionDate;
+    }
+    const price = Number(signal.price ?? 0);
+    const currentVolume = signal.currentVolume ?? null;
+    const averageVolume = signal.averageVolume ?? null;
+    const rvol = signal.relativeVolume ?? null;
+    const previousDayHigh = prior.dayHigh;
+    const previousSessionHigh = prior.sessionHigh;
+    const nextDayHigh = prior.dayHigh === null ? price : Math.max(prior.dayHigh, price);
+    const nextSessionHigh = prior.sessionHigh === null ? price : Math.max(prior.sessionHigh, price);
+    const quoteFreshEnough = signal.quoteFreshness === "fresh" || signal.quoteFreshness === "cached";
+    const scannerThresholds = cachedUniverseDiscovery.scannerThresholds;
+    const withinScannerPriceBounds = price >= scannerThresholds.minPrice && price <= scannerThresholds.maxPrice;
+    const volumePassesIfAvailable = currentVolume === null || currentVolume >= scannerThresholds.minVolume;
+    const dayHighUpdated = nextDayHigh > (previousDayHigh ?? Number.NEGATIVE_INFINITY);
+    const sessionHighUpdated = nextSessionHigh > (previousSessionHigh ?? Number.NEGATIVE_INFINITY);
+    const isNhodTransition =
+      quoteFreshEnough &&
+      price > 0 &&
+      withinScannerPriceBounds &&
+      volumePassesIfAvailable &&
+      (previousDayHigh === null || price > previousDayHigh) &&
+      dayHighUpdated;
+    const isNshTransition =
+      quoteFreshEnough &&
+      price > 0 &&
+      (previousSessionHigh === null || price > previousSessionHigh) &&
+      sessionHighUpdated &&
+      (marketClock.sessionStatus === "premarket" || marketClock.sessionStatus === "regular" || marketClock.sessionStatus === "after-hours");
+    const isGreenBars = signal.signalType === "GREEN_CANDLE_MOMENTUM";
+    const isVolumeSpike =
+      quoteFreshEnough &&
+      withinScannerPriceBounds &&
+      ((rvol !== null && rvol >= 3) || (currentVolume !== null && currentVolume >= 100_000));
+    const hasNews = Boolean(signal.newsHeadline);
+    const haltStatus: RunnerAlert["haltStatus"] = "none";
+    const isNewsPendingHalt = false;
+    const isHaltedUp = false;
+    const isHaltedDown = false;
+    const hasTheme = Boolean(signal.theme);
+    const hasSqueezeData =
+      (signal.costToBorrowPercent !== null && signal.costToBorrowPercent !== undefined && signal.costToBorrowPercent >= 20) ||
+      (signal.shortInterestPercent !== null && signal.shortInterestPercent !== undefined && signal.shortInterestPercent >= 20);
+    let alertType: RunnerAlert["alertType"] = "TEST";
+    if (isNewsPendingHalt) alertType = "NEWS_PENDING_HALT";
+    else if (isHaltedUp) alertType = "HALTED_UP";
+    else if (isHaltedDown) alertType = "HALTED_DOWN";
+    else if (hasNews) alertType = "PR_SPIKE";
+    else if (isNhodTransition) alertType = "NHOD";
+    else if (isNshTransition) alertType = "NSH";
+    else if (isGreenBars) alertType = "GREEN_BARS";
+    else if (isVolumeSpike) alertType = "VOLUME_SPIKE";
+    else if (hasTheme) alertType = "THEME";
+    else if (hasSqueezeData) alertType = "SQUEEZE_WATCH";
+    const newHigh = prior.lastAlertHigh !== null ? price > prior.lastAlertHigh : true;
+    const alertTypeChanged = prior.lastAlertType !== alertType;
+    const rvolImproved = prior.lastRelativeVolume !== null && rvol !== null ? rvol >= prior.lastRelativeVolume * 1.2 : false;
+    const volImproved = prior.lastVolume !== null && currentVolume !== null ? currentVolume >= prior.lastVolume * 1.1 : false;
+    const priorChange = prior.lastAlertPrice !== null ? ((price - prior.lastAlertPrice) / Math.max(0.00001, prior.lastAlertPrice)) * 100 : null;
+    const currentChange = signal.changePercent ?? 0;
+    const changeImproved = priorChange !== null ? (currentChange - priorChange) >= 5 : false;
+    const cooldownPassed = prior.lastAlertAt === null ? true : generatedAtMs - prior.lastAlertAt >= RUNNER_ALERT_MIN_REPEAT_MS;
+    const haltOrNewsEvent = alertType === "PR_SPIKE" || alertType === "NEWS_PENDING_HALT" || alertType === "HALTED_UP" || alertType === "HALTED_DOWN";
+    const shouldEmitBase = newHigh || alertTypeChanged || rvolImproved || volImproved || changeImproved || cooldownPassed || haltOrNewsEvent;
+    const recentAlertSuppressed =
+      prior.lastAlertAt !== null &&
+      generatedAtMs - prior.lastAlertAt < RUNNER_ALERT_MIN_REPEAT_MS &&
+      !volImproved &&
+      !rvolImproved;
+    const shouldEmit =
+      alertType === "VOLUME_SPIKE"
+        ? isVolumeSpike && quoteFreshEnough && withinScannerPriceBounds && !recentAlertSuppressed
+        : alertType === "TEST"
+          ? false
+          : shouldEmitBase;
+    const direction: "up" | "down" | "flat" = signal.changePercent > 0 ? "up" : signal.changePercent < 0 ? "down" : "flat";
+    const alertCountToday = shouldEmit ? prior.alertCountToday + 1 : prior.alertCountToday;
+    const timeLabel = new Date(signal.timestamp).toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: alertType.includes("HALTED") ? "2-digit" : undefined,
+      hour12: false,
+      timeZone: "America/New_York",
+    });
+    const intradayState = getSymbolIntradayState(signal.ticker);
+    const rvolLabel = compactRvol(rvol);
+    const volLabel = compactVolume(currentVolume);
+    const floatLabel = signal.floatShares !== null ? compactMoney(signal.floatShares) : null;
+    const marketCapLabel = signal.marketCap !== null ? compactMoney(signal.marketCap) : null;
+    const arrow = alertType === "GREEN_BARS" ? "↗" : direction === "up" ? "↑" : direction === "down" ? "↓" : "→";
+    const baseLine = `${timeLabel} ${arrow} ${signal.ticker} ${getPriceBucket(price)} ${Math.round(currentChange)}% · ${alertCountToday} ${alertType}`;
+    let formattedLine = baseLine;
+    if (alertType === "GREEN_BARS") {
+      const greenBarsCount = intradayState?.greenCandleCount ?? null;
+      const barsText = greenBarsCount !== null ? `${Math.max(1, Math.min(greenBarsCount, 5))} green bars 3m` : "green bars";
+      const segments = [
+        signal.countryFlag ?? null,
+        floatLabel ? `Float: ${floatLabel}` : null,
+        rvolLabel ? `RVol: ${rvolLabel}` : null,
+        volLabel ? `Vol: ${volLabel}` : null,
+        signal.newsHeadline ? "PR⬏" : null,
+      ].filter((value): value is string => Boolean(value));
+      formattedLine = `${timeLabel} ${arrow} ${signal.ticker} ${getPriceBucket(price)} ${Math.round(currentChange)}% · ${alertCountToday} ${barsText}${segments.length ? ` ~ ${segments.join(" | ")}` : ""}`;
+    } else if (alertType === "HALTED_UP" || alertType === "HALTED_DOWN" || alertType === "NEWS_PENDING_HALT") {
+      const haltLabel =
+        alertType === "HALTED_UP" ? "Halted UP" : alertType === "HALTED_DOWN" ? "Halted DOWN" : "Halted | News Pending";
+      formattedLine = `${timeLabel} ${signal.ticker} ${haltLabel} | Volatility → $${price.toFixed(2)}${volLabel ? ` ~ ${volLabel} vol` : ""}`;
+    } else if (alertType === "PR_SPIKE") {
+      const segments = [
+        signal.countryFlag ?? null,
+        floatLabel ? `Float: ${floatLabel}` : null,
+        signal.institutionalOwnershipPercent !== null && signal.institutionalOwnershipPercent !== undefined ? `IO: ${signal.institutionalOwnershipPercent.toFixed(2)}%` : null,
+        marketCapLabel ? `MC: ${marketCapLabel}` : null,
+        signal.theme ? `Theme: ${signal.theme}` : null,
+      ].filter((value): value is string => Boolean(value));
+      formattedLine = `${timeLabel} PR-SPIKE ${signal.ticker} ${getPriceBucket(price)} - ${signal.newsHeadline ?? "news"}${signal.newsUrl ? " - Link" : ""}${segments.length ? ` ~ ${segments.join(" | ")}` : ""}`;
+    } else {
+      const segments = [
+        signal.countryFlag ?? null,
+        floatLabel ? `Float: ${floatLabel}` : null,
+        rvolLabel ? `RVol: ${rvolLabel}` : null,
+        volLabel ? `Vol: ${volLabel}` : null,
+        signal.shortInterestPercent !== null && signal.shortInterestPercent !== undefined ? `SI: ${signal.shortInterestPercent.toFixed(1)}%` : null,
+        signal.costToBorrowPercent !== null && signal.costToBorrowPercent !== undefined && signal.costToBorrowPercent >= 20 ? "High CTB" : null,
+        signal.theme ? `Theme: ${signal.theme}` : null,
+      ].filter((value): value is string => Boolean(value));
+      formattedLine = segments.length ? `${baseLine} ~ ${segments.join(" | ")}` : baseLine;
+    }
+    const enrichedAlert: RunnerAlert = {
+      id: `${signal.ticker}-${generatedAtMs}-${alertType}-${alertCountToday}`,
+      ticker: signal.ticker,
+      timestamp: signal.timestamp,
+      alertTime: timeLabel,
+      source: hasNews ? "news" : "massive",
+      direction,
+      alertType,
+      tickerPrice: signal.price ?? null,
+      priceBucket: getPriceBucket(price),
+      changePercent: signal.changePercent ?? null,
+      alertCountToday,
+      countryCode: signal.countryCode ?? null,
+      countryFlag: signal.countryFlag ?? null,
+      currentVolume,
+      averageVolume,
+      relativeVolume: rvol,
+      floatShares: signal.floatShares ?? null,
+      marketCap: signal.marketCap ?? null,
+      institutionalOwnershipPercent: signal.institutionalOwnershipPercent ?? null,
+      shortInterestPercent: signal.shortInterestPercent ?? null,
+      costToBorrowPercent: signal.costToBorrowPercent ?? null,
+      highCostToBorrow: Boolean(signal.costToBorrowPercent !== null && signal.costToBorrowPercent !== undefined && signal.costToBorrowPercent >= 20),
+      theme: signal.theme ?? null,
+      newsHeadline: signal.newsHeadline ?? null,
+      newsUrl: signal.newsUrl ?? null,
+      haltStatus: haltStatus ?? "none",
+      haltReason: null,
+      sessionHigh: nextSessionHigh,
+      dayHigh: nextDayHigh,
+      previousSessionHigh,
+      previousDayHigh,
+      score: signal.finalScore,
+      reason: signal.reason,
+      formattedLine,
+    };
+
+    runnerAlertStateByTicker.set(signal.ticker, {
+      ticker: signal.ticker,
+      sessionDate: marketClock.sessionDate,
+      alertCountToday,
+      dayHigh: nextDayHigh,
+      sessionHigh: nextSessionHigh,
+      previousDayHigh,
+      previousSessionHigh,
+      lastAlertPrice: shouldEmit ? price : prior.lastAlertPrice,
+      lastAlertHigh: shouldEmit ? Math.max(prior.lastAlertHigh ?? price, price) : prior.lastAlertHigh,
+      lastAlertType: shouldEmit ? alertType : prior.lastAlertType,
+      lastAlertAt: shouldEmit ? generatedAtMs : prior.lastAlertAt,
+      lastAlertScore: shouldEmit ? signal.finalScore : prior.lastAlertScore,
+      lastVolume: shouldEmit ? currentVolume : prior.lastVolume,
+      lastRelativeVolume: shouldEmit ? rvol : prior.lastRelativeVolume,
+      lastFormattedLine: shouldEmit ? formattedLine : prior.lastFormattedLine,
+    });
+    const suppressedReason =
+      shouldEmit
+        ? null
+        : alertType === "TEST"
+          ? "unclassified_event_skipped"
+        : alertType === "VOLUME_SPIKE" && recentAlertSuppressed
+          ? "volume_spike_cooldown_no_strength_increase"
+          : "duplicate_not_stronger";
+    transitionLog.push({
+      time: signal.timestamp,
+      ticker: signal.ticker,
+      previousDayHigh,
+      newDayHigh: nextDayHigh,
+      previousSessionHigh,
+      newSessionHigh: nextSessionHigh,
+      alertType,
+      emitted: shouldEmit,
+      suppressedReason,
+    });
+    if (shouldEmit) {
+      alerts.push(enrichedAlert);
+    } else {
+      suppressedDuplicateAlerts.push({
+        time: signal.timestamp,
+        ticker: signal.ticker,
+        alertType,
+        reason: suppressedReason ?? "duplicate_not_stronger",
+      });
+    }
+  }
+
   const topRejected = evaluation.watchlist
     .filter((item) => !item.hasActiveSignal)
     .map((item) => ({
@@ -820,6 +1437,25 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     emittedSignals: cycleEmittedSignals.length,
     topRejected,
     sampleSnapshots,
+  };
+  const runtimeRejectionCounts: Record<string, number> = {
+    missing_quote: 0,
+    no_signal_yet: 0,
+  };
+  for (const item of evaluation.watchlist) {
+    if (!item.hasActiveSignal) {
+      runtimeRejectionCounts.no_signal_yet += 1;
+    }
+    if (item.exclusionReason) {
+      runtimeRejectionCounts[item.exclusionReason] = (runtimeRejectionCounts[item.exclusionReason] ?? 0) + 1;
+      if (item.exclusionReason === "missing_quote") {
+        runtimeRejectionCounts.missing_quote += 1;
+      }
+    }
+  }
+  scannerDiagnostics.rejectionReasonCounts = {
+    ...scannerDiagnostics.rejectionReasonCounts,
+    ...runtimeRejectionCounts,
   };
   const activeNowLayer = buildLiveAlertsNow({
     signals: activeSignals,
@@ -897,6 +1533,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       sessionStatus: marketClock.sessionStatus,
       sessionLabel: marketClock.label,
       signals: activeSignals,
+      alerts,
       watchlist:
         evaluation.watchlist.length > 0
           ? evaluation.watchlist
@@ -915,6 +1552,18 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       universeAdjusted: universeSelection.universeAdjusted,
       universeMessage: universeSelection.universeMessage,
       marketData,
+      streamHealth: {
+        connected: streamHealth.connected,
+        reconnecting: streamHealth.reconnecting,
+        statusOnlyStream: streamHealth.statusOnlyStream,
+        degraded: streamHealth.degraded,
+        degradedReason: streamHealth.degradedReason ?? null,
+        wsMessagesReceived: streamHealth.wsMessagesReceived,
+        wsUpdatesApplied: streamHealth.wsUpdatesApplied,
+        lastMessageAt: streamHealth.lastMessageAt,
+        lastWsUpdateAt: streamHealth.lastWsUpdateAt,
+      },
+      scannerDiagnostics,
       diagnostics: engineDiagnostics,
     };
   } else {
@@ -959,6 +1608,7 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       sessionStatus: marketClock.sessionStatus,
       sessionLabel: marketClock.label,
       signals: activeSignals,
+      alerts,
       watchlist: evaluation.watchlist,
       lastUpdated: lastQuoteUpdate ?? evaluation.generatedAt,
       persistence: nextPersistenceStatus,
@@ -972,6 +1622,18 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       universeAdjusted: universeSelection.universeAdjusted,
       universeMessage: universeSelection.universeMessage,
       marketData,
+      streamHealth: {
+        connected: streamHealth.connected,
+        reconnecting: streamHealth.reconnecting,
+        statusOnlyStream: streamHealth.statusOnlyStream,
+        degraded: streamHealth.degraded,
+        degradedReason: streamHealth.degradedReason ?? null,
+        wsMessagesReceived: streamHealth.wsMessagesReceived,
+        wsUpdatesApplied: streamHealth.wsUpdatesApplied,
+        lastMessageAt: streamHealth.lastMessageAt,
+        lastWsUpdateAt: streamHealth.lastWsUpdateAt,
+      },
+      scannerDiagnostics,
       diagnostics: engineDiagnostics,
     };
   }
@@ -1077,6 +1739,27 @@ export function getSharedLiveStateStore() {
   };
 }
 
+export function getRunnerAlertDebugState() {
+  return {
+    highTracking: [...runnerAlertStateByTicker.entries()].map(([ticker, state]) => ({
+      ticker,
+      sessionDate: state.sessionDate,
+      dayHigh: state.dayHigh,
+      sessionHigh: state.sessionHigh,
+      previousDayHigh: state.previousDayHigh,
+      previousSessionHigh: state.previousSessionHigh,
+      lastAlertHigh: state.lastAlertHigh,
+      alertCountToday: state.alertCountToday,
+      lastAlertType: state.lastAlertType,
+      lastAlertAt: state.lastAlertAt ? new Date(state.lastAlertAt).toISOString() : null,
+      lastVolume: state.lastVolume,
+      lastRelativeVolume: state.lastRelativeVolume,
+    })),
+    suppressedDuplicates: [...suppressedDuplicateAlerts].slice(-200),
+    transitionLog: [...transitionLog].slice(-400),
+  };
+}
+
 export function getLiveSessionRuntimeStatus() {
   const snapshot = liveStateStore.snapshot;
   const runtimeConfig = getSignalRuntimeConfig();
@@ -1117,18 +1800,33 @@ export function __resetLiveSessionRuntimeForTests() {
   lastDemandAt = 0;
   persistedState = null;
   latestPersistenceStatus = null;
+  alertMemorySessionDate = null;
   cachedUniverseCandidates = [];
   cachedUniverseDiscovery = {
     source: "fallback_empty",
     discoveredCount: 0,
+    discoveredBeforeFilters: 0,
     selectedCount: 0,
     topSymbols: [],
     reasonsBySymbol: {},
+    scannerThresholds: {
+      minPrice: 0.1,
+      maxPrice: 20,
+      minVolume: 0,
+      minRelativeVolume: 0,
+      minAbsChangePercent: 0,
+      bullishOnly: false,
+    },
+    rejectionReasonCounts: {},
+    topCandidates: [],
   };
   nextUniverseRefreshAt = 0;
   cachedNewsByTicker = new Map();
   nextNewsRefreshAt = 0;
   signalMemoryBySymbol.clear();
+  runnerAlertStateByTicker.clear();
+  suppressedDuplicateAlerts.length = 0;
+  transitionLog.length = 0;
   liveStateStore.version = 0;
   liveStateStore.snapshot = null;
   liveStateStore.latestQuotes = [];

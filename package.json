@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "node --experimental-strip-types scripts/support-agent-tests.ts && node --experimental-strip-types scripts/support-agent-sse-tests.ts && tsx scripts/signal-engine-tests.ts",
     "typecheck": "tsc --noEmit",
     "migrate:blob-to-supabase": "node scripts/migrate-blob-state-to-supabase-storage.mjs"
   },
@@ -17,6 +18,7 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@next/swc-wasm-nodejs": "^15.5.15",
     "@types/node": "^22.10.1",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
@@ -25,6 +27,7 @@
     "eslint-config-next": "^15.0.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.2"
   }
 }

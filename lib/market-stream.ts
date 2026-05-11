@@ -1,4 +1,4 @@
-import { fetchMassiveStockSnapshots, getMassiveApiKey } from "./providers/massive";
+import { fetchMassiveRecentIntradayForSymbols, fetchMassiveStockSnapshots, getMassiveApiKey } from "./providers/massive";
 import { getDynamicMarketUniverse } from "./market-universe";
 import type { QuoteFetchResult, QuoteSnapshot, QuoteState, QuoteFetchSummary, QuoteFreshness } from "./market-data";
 import { consumeRateLimitToken } from "./request-rate-limiter";
@@ -15,18 +15,62 @@ type SymbolLiveState = {
   lastUpdated: string;
   currentVolume: number | null;
   averageVolume: number | null;
+  dayHigh: number | null;
+  dayLow: number | null;
+  minuteBucket: string | null;
+  minuteOpen: number | null;
+  minuteHigh: number | null;
+  minuteLow: number | null;
+  minuteClose: number | null;
+  minuteVolume: number | null;
+  previousMinuteHigh: number | null;
+  previousMinuteLow: number | null;
+  previousMinuteVolume: number | null;
+  oneMinuteChangePercent: number | null;
+  fiveMinuteChangePercent: number | null;
+  greenCandleCount: number | null;
+  breakoutAboveRecentHigh: boolean;
+  sma5: number | null;
+  sma10: number | null;
+  smaMomentumConfirmed: boolean;
   provider: "massive";
+};
+
+export type SymbolIntradayState = {
+  ticker: string;
+  dayHigh: number | null;
+  dayLow: number | null;
+  lastPrice: number;
+  lastUpdated: string;
+  previousMinuteHigh: number | null;
+  previousMinuteLow: number | null;
+  currentMinuteHigh: number | null;
+  currentMinuteLow: number | null;
+  currentMinuteVolume: number | null;
+  previousMinuteVolume: number | null;
+  oneMinuteChangePercent: number | null;
+  fiveMinuteChangePercent: number | null;
+  greenCandleCount: number | null;
+  breakoutAboveRecentHigh: boolean;
+  sma5: number | null;
+  sma10: number | null;
+  smaMomentumConfirmed: boolean;
 };
 
 type MarketStreamHealth = {
   status: StreamConnectionState;
   connected: boolean;
+  authenticated?: boolean;
+  subscribed?: boolean;
   realtime: boolean;
   mode: "realtime" | "delayed" | "unknown";
   lastMessageAt: string | null;
+  lastWebSocketConnectAt: string | null;
   lastBootstrapAt: string | null;
   lastForcedDisconnectAt: string | null;
   subscribedSymbolCount: number;
+  subscribedTradeCount: number;
+  subscribedAggregateCount: number;
   activeUniverseSize: number;
   snapshotSymbolCount: number;
   messagesPerMinute: number;
@@ -44,6 +88,8 @@ type MarketStreamHealth = {
   wsUpdatesApplied: number;
   snapshotUpdatesApplied: number;
   lastWsUpdateAt: string | null;
+  lastTradeAt: string | null;
+  lastAggregateAt: string | null;
   lastSnapshotUpdateAt: string | null;
   wsMessageSamples: Array<{
     messageType: string;
@@ -51,16 +97,45 @@ type MarketStreamHealth = {
     updatesParsed: number;
   }>;
   statusOnlyStream: boolean;
+  aggregateUnauthorized: boolean;
+  appStartedAt: string | null;
+  lastDiscoveryAt: string | null;
+  lastDiscoveryStatus: string | null;
+  lastUniverseCount: number;
+  startup: {
+    massiveKeyConfigured: boolean;
+    discoveryAttempted: boolean;
+    websocketAttempted: boolean;
+  };
+  degradedReason?: string | null;
 };
 
 type DynamicUniverseState = {
   symbols: WatchlistTicker[];
   lastRefreshedAt: number;
-  source: "live" | "cache" | "fallback_empty" | "fallback_default";
+  source: "live" | "cache" | "fallback_empty";
   reasonsBySymbol: Record<string, string>;
   topSymbols: string[];
   discoveredCount: number;
   selectedCount: number;
+  discoveredBeforeFilters: number;
+  scannerThresholds: {
+    minPrice: number;
+    maxPrice: number;
+    minVolume: number;
+    minRelativeVolume: number;
+    minAbsChangePercent: number;
+    bullishOnly: boolean;
+  };
+  rejectionReasonCounts: Record<string, number>;
+  topCandidates: Array<{
+    ticker: string;
+    price: number;
+    changePercent: number;
+    currentVolume: number;
+    relativeVolume: number | null;
+    reason: string;
+  }>;
 };
 
 type MarketStreamManager = {
@@ -100,6 +175,21 @@ type MarketStreamManager = {
     updatesParsed: number;
   }>;
   lastStatusOnlyFallbackAt: number;
+  degradedReason: string | null;
+  wsMessageTypeLogSet: Set<string>;
+  subscribedTradeSymbols: Set<string>;
+  subscribedAggregateSymbols: Set<string>;
+  aggregateUnauthorized: boolean;
+  appStartedAt: number;
+  lastWebSocketConnectAt: number;
+  lastDiscoveryAt: number;
+  lastDiscoveryStatus: string | null;
+  lastUniverseCount: number;
+  lastTradeAt: number;
+  lastAggregateAt: number;
+  startupMassiveKeyConfigured: boolean;
+  startupDiscoveryAttempted: boolean;
+  startupWebsocketAttempted: boolean;
 };
 
 const WS_ENDPOINT = process.env.MASSIVE_WS_URL?.trim() || "wss://socket.massive.com/stocks";
@@ -108,7 +198,6 @@ const DEFAULT_BOOTSTRAP_REFRESH_MS = 30_000;
 const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 const CLOSE_CODE_NORMAL = 1000;
-const DEFAULT_FALLBACK_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "GOOG", "SPY", "QQQ"] as const;
 
 declare global {
   var __pulseGridMarketStreamManager__: MarketStreamManager | undefined;
@@ -119,6 +208,8 @@ function createManager(): MarketStreamManager {
     symbolState: new Map(),
     messageTimestamps: [],
     subscribedSymbols: new Set(),
+    subscribedTradeSymbols: new Set(),
+    subscribedAggregateSymbols: new Set(),
     dynamicUniverse: {
       symbols: [],
       lastRefreshedAt: 0,
@@ -127,6 +218,17 @@ function createManager(): MarketStreamManager {
       topSymbols: [],
       discoveredCount: 0,
       selectedCount: 0,
+      discoveredBeforeFilters: 0,
+      scannerThresholds: {
+        minPrice: 0.1,
+        maxPrice: 20,
+        minVolume: 0,
+        minRelativeVolume: 0,
+        minAbsChangePercent: 0,
+        bullishOnly: false,
+      },
+      rejectionReasonCounts: {},
+      topCandidates: [],
     },
     streamSocket: null,
     connectPromise: null,
@@ -156,6 +258,19 @@ function createManager(): MarketStreamManager {
     hasSubscribed: false,
     wsMessageSamples: [],
     lastStatusOnlyFallbackAt: 0,
+    degradedReason: null,
+    wsMessageTypeLogSet: new Set<string>(),
+    aggregateUnauthorized: false,
+    appStartedAt: 0,
+    lastWebSocketConnectAt: 0,
+    lastDiscoveryAt: 0,
+    lastDiscoveryStatus: null,
+    lastUniverseCount: 0,
+    lastTradeAt: 0,
+    lastAggregateAt: 0,
+    startupMassiveKeyConfigured: false,
+    startupDiscoveryAttempted: false,
+    startupWebsocketAttempted: false,
   };
 }
 
@@ -164,18 +279,6 @@ globalThis.__pulseGridMarketStreamManager__ = manager;
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function toFallbackTicker(symbol: string): WatchlistTicker {
-  return {
-    ticker: symbol,
-    company: symbol,
-    sector: "Fallback",
-    exchange: "UNKNOWN",
-    instrumentType: "Common Stock",
-    country: "US",
-    floatShares: null,
-  };
 }
 
 function log(event: string, details?: Record<string, unknown>) {
@@ -214,6 +317,15 @@ function updateSymbolState(partial: {
   timestamp?: string | null;
   currentVolume?: number | null;
   averageVolume?: number | null;
+  dayHigh?: number | null;
+  dayLow?: number | null;
+  oneMinuteChangePercent?: number | null;
+  fiveMinuteChangePercent?: number | null;
+  greenCandleCount?: number | null;
+  breakoutAboveRecentHigh?: boolean;
+  sma5?: number | null;
+  sma10?: number | null;
+  smaMomentumConfirmed?: boolean;
   source?: "ws" | "snapshot";
 }) {
   const ticker = partial.ticker.trim().toUpperCase();
@@ -226,15 +338,67 @@ function updateSymbolState(partial: {
     return;
   }
 
+  const timestampIso = partial.timestamp ?? existing?.lastUpdated ?? nowIso();
+  const minuteBucket = timestampIso.slice(0, 16);
+  const previousMinuteSameBucket = existing?.minuteBucket && existing.minuteBucket === minuteBucket;
+  const previousMinuteVolume = existing?.minuteVolume ?? null;
+  const nextMinuteVolume =
+    partial.currentVolume !== undefined
+      ? (partial.currentVolume ?? null)
+      : previousMinuteSameBucket
+        ? existing?.minuteVolume ?? null
+        : null;
+  const priorMinuteClose = existing?.minuteClose ?? price;
+  const minuteOpen =
+    previousMinuteSameBucket
+      ? existing?.minuteOpen ?? price
+      : partial.currentVolume !== undefined && partial.currentVolume !== null
+        ? price
+        : priorMinuteClose;
+  const minuteHigh = previousMinuteSameBucket
+    ? Math.max(existing?.minuteHigh ?? price, price)
+    : price;
+  const minuteLow = previousMinuteSameBucket
+    ? Math.min(existing?.minuteLow ?? price, price)
+    : price;
+
   manager.symbolState.set(ticker, {
     ticker,
     price,
     changePercent,
-    lastUpdated: partial.timestamp ?? existing?.lastUpdated ?? nowIso(),
+    lastUpdated: timestampIso,
     currentVolume:
       partial.currentVolume !== undefined ? partial.currentVolume : existing?.currentVolume ?? null,
     averageVolume:
       partial.averageVolume !== undefined ? partial.averageVolume : existing?.averageVolume ?? null,
+    dayHigh:
+      partial.dayHigh !== undefined
+        ? partial.dayHigh
+        : existing?.dayHigh !== null && existing?.dayHigh !== undefined
+          ? Math.max(existing.dayHigh, price)
+          : price,
+    dayLow:
+      partial.dayLow !== undefined
+        ? partial.dayLow
+        : existing?.dayLow !== null && existing?.dayLow !== undefined
+          ? Math.min(existing.dayLow, price)
+          : price,
+    minuteBucket,
+    minuteOpen,
+    minuteHigh,
+    minuteLow,
+    minuteClose: price,
+    minuteVolume: nextMinuteVolume,
+    previousMinuteHigh: previousMinuteSameBucket ? existing?.previousMinuteHigh ?? null : existing?.minuteHigh ?? null,
+    previousMinuteLow: previousMinuteSameBucket ? existing?.previousMinuteLow ?? null : existing?.minuteLow ?? null,
+    previousMinuteVolume: previousMinuteSameBucket ? existing?.previousMinuteVolume ?? null : previousMinuteVolume,
+    oneMinuteChangePercent: partial.oneMinuteChangePercent ?? existing?.oneMinuteChangePercent ?? null,
+    fiveMinuteChangePercent: partial.fiveMinuteChangePercent ?? existing?.fiveMinuteChangePercent ?? null,
+    greenCandleCount: partial.greenCandleCount ?? existing?.greenCandleCount ?? null,
+    breakoutAboveRecentHigh: partial.breakoutAboveRecentHigh ?? existing?.breakoutAboveRecentHigh ?? false,
+    sma5: partial.sma5 ?? existing?.sma5 ?? null,
+    sma10: partial.sma10 ?? existing?.sma10 ?? null,
+    smaMomentumConfirmed: partial.smaMomentumConfirmed ?? existing?.smaMomentumConfirmed ?? false,
     provider: "massive",
   });
   if (partial.source === "ws") {
@@ -252,6 +416,8 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
   changePercent?: number | null;
   timestamp?: string | null;
   currentVolume?: number | null;
+  dayHigh?: number | null;
+  dayLow?: number | null;
 }> {
   if (!payload) return [];
   const rows = Array.isArray(payload) ? payload : [payload];
@@ -261,6 +427,8 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
     changePercent?: number | null;
     timestamp?: string | null;
     currentVolume?: number | null;
+    dayHigh?: number | null;
+    dayLow?: number | null;
   }> = [];
 
   for (const row of rows) {
@@ -277,6 +445,8 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
       parseNumber(entry.close);
     const changePercent = parseNumber(entry.dp) ?? parseNumber(entry.changePercent) ?? parseNumber(entry.todaysChangePerc);
     const currentVolume = parseNumber(entry.v) ?? parseNumber(entry.volume) ?? parseNumber(entry.dayVolume);
+    const dayHigh = parseNumber(entry.h) ?? parseNumber(entry.dayHigh);
+    const dayLow = parseNumber(entry.l) ?? parseNumber(entry.dayLow);
     const timestampRaw = parseNumber(entry.t) ?? parseNumber(entry.e) ?? parseNumber(entry.timestamp);
     const timestamp =
       timestampRaw !== null
@@ -289,6 +459,8 @@ function parsePotentialTickUpdate(payload: unknown): Array<{
       changePercent,
       timestamp,
       currentVolume,
+      dayHigh,
+      dayLow,
     });
   }
 
@@ -306,6 +478,10 @@ function captureWsMessageSample(parsed: unknown, updatesParsed: number) {
     (typeof entry.event === "string" && entry.event) ||
     (typeof entry.status === "string" && `status:${entry.status}`) ||
     "unknown";
+  if (!manager.wsMessageTypeLogSet.has(messageType)) {
+    manager.wsMessageTypeLogSet.add(messageType);
+    console.log("[massive-ws] raw sample", { messageType, updatesParsed, keys });
+  }
   manager.wsMessageSamples.push({
     messageType,
     keys,
@@ -316,9 +492,11 @@ function captureWsMessageSample(parsed: unknown, updatesParsed: number) {
 function buildSubscribePayload() {
   const symbols = [...manager.subscribedSymbols];
   if (!symbols.length) return null;
+  manager.subscribedTradeSymbols = new Set(symbols);
+  manager.subscribedAggregateSymbols = new Set(symbols);
   return {
     action: "subscribe",
-    params: symbols.map((ticker) => `T.${ticker}`).join(","),
+    params: symbols.flatMap((ticker) => [`T.${ticker}`, `AM.${ticker}`]).join(","),
   };
 }
 
@@ -437,6 +615,7 @@ async function connectSocket(reason: string) {
   console.log("[massive] api key configured:", Boolean(key));
   if (!key) {
     manager.streamState = "degraded";
+    manager.degradedReason = "Massive API key is missing.";
     log("connect_blocked_missing_api_key", { reason });
     return;
   }
@@ -454,6 +633,7 @@ async function connectSocket(reason: string) {
     } catch (error) {
       manager.streamState = "degraded";
       manager.streamSocket = null;
+      manager.degradedReason = "WebSocket constructor failed.";
       log("connect_constructor_failed", { reason, error: error instanceof Error ? error.message : String(error) });
       scheduleReconnect("constructor_failed");
       return;
@@ -471,7 +651,9 @@ async function connectSocket(reason: string) {
 
       const wasReconnecting = manager.reconnectAttempt > 0;
       manager.streamState = "connected";
+      manager.degradedReason = null;
       console.log("[massive-ws] connected");
+      manager.lastWebSocketConnectAt = Date.now();
       manager.isAuthenticated = false;
       manager.hasSubscribed = false;
       manager.reconnectAttempt = 0;
@@ -501,15 +683,71 @@ async function connectSocket(reason: string) {
         console.log("[massive-ws] authenticated");
         sendSubscribe(socket);
       }
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const entry = row as Record<string, unknown>;
+        const status = typeof entry.status === "string" ? entry.status.toLowerCase() : "";
+        const message = typeof entry.message === "string" ? entry.message.toLowerCase() : "";
+        if ((status.includes("unauthorized") || message.includes("unauthorized")) && message.includes("am.")) {
+          manager.aggregateUnauthorized = true;
+        }
+        const ev = typeof entry.ev === "string" ? entry.ev.toUpperCase() : "";
+        const tsRaw = parseNumber(entry.t) ?? parseNumber(entry.sip_timestamp);
+        const ts = tsRaw !== null ? (tsRaw > 9_999_999_999_999 ? Math.floor(tsRaw / 1_000_000) : tsRaw) : Date.now();
+        if (ev === "T") {
+          manager.lastTradeAt = Date.now();
+        }
+        if (ev === "AM") {
+          manager.lastAggregateAt = Date.now();
+          const symbol = typeof entry.sym === "string" ? entry.sym.trim().toUpperCase() : "";
+          const open = parseNumber(entry.o);
+          const high = parseNumber(entry.h);
+          const low = parseNumber(entry.l);
+          const close = parseNumber(entry.c);
+          const volume = parseNumber(entry.v);
+          if (symbol && close !== null) {
+            updateSymbolState({
+              ticker: symbol,
+              price: close,
+              timestamp: new Date(ts).toISOString(),
+              currentVolume: volume,
+              dayHigh: high,
+              dayLow: low,
+              source: "ws",
+            });
+            if (open !== null) {
+              const existing = manager.symbolState.get(symbol);
+              if (existing) {
+                const greenCount = (existing.greenCandleCount ?? 0) + (close > open ? 1 : 0);
+                updateSymbolState({
+                  ticker: symbol,
+                  greenCandleCount: greenCount,
+                  source: "ws",
+                });
+              }
+            }
+          }
+        }
+      }
 
       const updates = parsePotentialTickUpdate(parsed);
       console.log("[massive-ws] message received");
       captureWsMessageSample(parsed, updates.length);
       for (const update of updates) {
+        console.log("[massive-ws] trade parsed", {
+          symbol: update.ticker,
+          price: update.price ?? null,
+          timestamp: update.timestamp ?? null,
+        });
         updateSymbolState({
           ...update,
           source: "ws",
         });
+      }
+      if (updates.length > 0) {
+        console.log("[massive-ws] ws updates applied count", manager.wsUpdatesApplied);
+        manager.degradedReason = null;
       }
     });
 
@@ -523,6 +761,7 @@ async function connectSocket(reason: string) {
       }
 
       manager.streamState = "disconnected";
+      manager.degradedReason = `WebSocket ${eventType} event received.`;
       manager.isAuthenticated = false;
       manager.hasSubscribed = false;
       console.log("[massive-ws] disconnected");
@@ -568,19 +807,18 @@ async function refreshUniverse() {
     log("rate_budget_limited_exited", { source: "universe_refresh" });
   }
 
+  manager.lastDiscoveryAt = Date.now();
+  manager.startupDiscoveryAttempted = true;
   const discovered = await getDynamicMarketUniverse({
     cap: runtimeConfig.maxSymbolsPerScan,
   });
-  const fallbackCandidates = DEFAULT_FALLBACK_SYMBOLS.map((symbol) => toFallbackTicker(symbol));
-  const useFallbackDefault = discovered.candidates.length === 0;
-  const candidates = useFallbackDefault ? fallbackCandidates : discovered.candidates;
-  const source = useFallbackDefault ? "fallback_default" : discovered.source;
-  const reasonsBySymbol = useFallbackDefault
-    ? Object.fromEntries(DEFAULT_FALLBACK_SYMBOLS.map((symbol) => [symbol, "fallback_default_watchlist"]))
+  const useEmptyFallback = discovered.candidates.length === 0;
+  const candidates = useEmptyFallback ? [] : discovered.candidates;
+  const source = useEmptyFallback ? "fallback_empty" : discovered.source;
+  const reasonsBySymbol = useEmptyFallback
+    ? { __universe__: "No low-price bullish momentum symbols matched current scanner filters." }
     : discovered.reasonsBySymbol;
-  const topSymbols = useFallbackDefault
-    ? DEFAULT_FALLBACK_SYMBOLS.slice(0, Math.min(DEFAULT_FALLBACK_SYMBOLS.length, runtimeConfig.maxSymbolsPerScan))
-    : discovered.topSymbols;
+  const topSymbols = useEmptyFallback ? [] : discovered.topSymbols;
 
   manager.dynamicUniverse = {
     symbols: candidates,
@@ -590,7 +828,13 @@ async function refreshUniverse() {
     topSymbols,
     discoveredCount: discovered.discoveredCount,
     selectedCount: candidates.length,
+    discoveredBeforeFilters: discovered.discoveredBeforeFilters,
+    scannerThresholds: discovered.scannerThresholds,
+    rejectionReasonCounts: discovered.rejectionReasonCounts,
+    topCandidates: discovered.topCandidates,
   };
+  manager.lastUniverseCount = candidates.length;
+  manager.lastDiscoveryStatus = `ok:${discovered.discoveredCount}/${candidates.length}`;
 
   manager.subscribedSymbols.clear();
   for (const symbol of candidates) {
@@ -652,6 +896,8 @@ async function bootstrapQuotes() {
         parseNumber(row.day && (row.day as Record<string, unknown>).c);
       const changePercent = parseNumber(row.todaysChangePerc);
       const dayVolume = parseNumber(row.day && (row.day as Record<string, unknown>).v);
+      const dayHigh = parseNumber(row.day && (row.day as Record<string, unknown>).h);
+      const dayLow = parseNumber(row.day && (row.day as Record<string, unknown>).l);
       const prevVolume = parseNumber(row.prevDay && (row.prevDay as Record<string, unknown>).v);
       const averageVolume = prevVolume !== null && prevVolume > 0 ? prevVolume : null;
       updateSymbolState({
@@ -660,10 +906,30 @@ async function bootstrapQuotes() {
         changePercent,
         currentVolume: dayVolume,
         averageVolume,
+        dayHigh,
+        dayLow,
         timestamp: nowIso(),
         source: "snapshot",
       });
     }
+    const intradayMetrics = await fetchMassiveRecentIntradayForSymbols([...manager.subscribedSymbols], {
+      lookbackMinutes: 120,
+      limit: 240,
+    });
+    for (const metrics of intradayMetrics) {
+      updateSymbolState({
+        ticker: metrics.ticker,
+        oneMinuteChangePercent: metrics.oneMinuteChangePercent,
+        fiveMinuteChangePercent: metrics.fiveMinuteChangePercent,
+        greenCandleCount: metrics.greenCandleCount,
+        breakoutAboveRecentHigh: metrics.breakoutAboveRecentHigh,
+        sma5: metrics.sma5,
+        sma10: metrics.sma10,
+        smaMomentumConfirmed: metrics.smaMomentumConfirmed,
+        source: "snapshot",
+      });
+    }
+    manager.degradedReason = null;
 
     manager.lastBootstrapAt = Date.now();
   } catch (error) {
@@ -698,6 +964,8 @@ function monitorStreamHealth() {
     if (now - manager.lastStatusOnlyFallbackAt > 60_000) {
       manager.lastStatusOnlyFallbackAt = now;
       log("status_only_stream_refresh_fallback");
+      console.warn("[massive-ws] status-only stream detected");
+      manager.degradedReason = "WebSocket connected but no trade ticks received.";
     }
     void bootstrapQuotes().catch((error) => {
       log("status_only_stream_refresh_failed", {
@@ -741,22 +1009,38 @@ export async function startMarketStream() {
   registerShutdownHandlers();
 
   if (manager.started) {
+    manager.startupWebsocketAttempted = true;
     await connectSocket("start_reuse");
     return;
   }
 
   manager.started = true;
   manager.streamStartedAt = Date.now();
+  manager.appStartedAt = manager.streamStartedAt;
+  manager.startupMassiveKeyConfigured = Boolean(getMassiveApiKey());
+  const easternNow = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date());
+  console.log("[startup] scanner session status", { easternTime: easternNow });
+  console.log("[startup] massive key configured", manager.startupMassiveKeyConfigured);
   log("stream_start");
 
   try {
+    console.log("[startup] discovery attempted");
     await refreshUniverse();
     await bootstrapQuotes();
   } catch (error) {
+    manager.lastDiscoveryStatus = `error:${error instanceof Error ? error.message : String(error)}`;
     log("stream_bootstrap_phase_failed", { error: error instanceof Error ? error.message : String(error) });
   }
 
   ensureIntervals();
+  manager.startupWebsocketAttempted = true;
+  console.log("[startup] websocket attempted");
   await connectSocket("initial_start");
 }
 
@@ -781,6 +1065,31 @@ export function getSymbolSnapshot(symbol: string): QuoteSnapshot | null {
     lastUpdated: entry.lastUpdated,
     freshness: freshnessFromTimestamp(entry.lastUpdated),
     provider: "massive",
+  };
+}
+
+export function getSymbolIntradayState(symbol: string): SymbolIntradayState | null {
+  const entry = manager.symbolState.get(symbol.trim().toUpperCase());
+  if (!entry) return null;
+  return {
+    ticker: entry.ticker,
+    dayHigh: entry.dayHigh,
+    dayLow: entry.dayLow,
+    lastPrice: entry.price,
+    lastUpdated: entry.lastUpdated,
+    previousMinuteHigh: entry.previousMinuteHigh,
+    previousMinuteLow: entry.previousMinuteLow,
+    currentMinuteHigh: entry.minuteHigh,
+    currentMinuteLow: entry.minuteLow,
+    currentMinuteVolume: entry.minuteVolume,
+    previousMinuteVolume: entry.previousMinuteVolume,
+    oneMinuteChangePercent: entry.oneMinuteChangePercent,
+    fiveMinuteChangePercent: entry.fiveMinuteChangePercent,
+    greenCandleCount: entry.greenCandleCount,
+    breakoutAboveRecentHigh: entry.breakoutAboveRecentHigh,
+    sma5: entry.sma5,
+    sma10: entry.sma10,
+    smaMomentumConfirmed: entry.smaMomentumConfirmed,
   };
 }
 
@@ -856,6 +1165,10 @@ export function getDynamicUniverse() {
     topSymbols: manager.dynamicUniverse.topSymbols,
     discoveredCount: manager.dynamicUniverse.discoveredCount,
     selectedCount: manager.dynamicUniverse.selectedCount,
+    discoveredBeforeFilters: manager.dynamicUniverse.discoveredBeforeFilters,
+    scannerThresholds: manager.dynamicUniverse.scannerThresholds,
+    rejectionReasonCounts: manager.dynamicUniverse.rejectionReasonCounts,
+    topCandidates: manager.dynamicUniverse.topCandidates,
   };
 }
 
@@ -912,12 +1225,17 @@ export function getMarketStreamHealth(): MarketStreamHealth {
   return {
     status: manager.streamState,
     connected: manager.streamState === "connected",
+    authenticated: manager.isAuthenticated,
+    subscribed: manager.hasSubscribed,
     realtime: manager.streamState === "connected" && !stale,
     mode,
     lastMessageAt: manager.lastMessageAt ? new Date(manager.lastMessageAt).toISOString() : null,
+    lastWebSocketConnectAt: manager.lastWebSocketConnectAt ? new Date(manager.lastWebSocketConnectAt).toISOString() : null,
     lastBootstrapAt: manager.lastBootstrapAt ? new Date(manager.lastBootstrapAt).toISOString() : null,
     lastForcedDisconnectAt: manager.lastForcedDisconnectAt ? new Date(manager.lastForcedDisconnectAt).toISOString() : null,
     subscribedSymbolCount: manager.subscribedSymbols.size,
+    subscribedTradeCount: manager.subscribedTradeSymbols.size,
+    subscribedAggregateCount: manager.subscribedAggregateSymbols.size,
     activeUniverseSize: manager.dynamicUniverse.symbols.length,
     snapshotSymbolCount: manager.symbolState.size,
     messagesPerMinute: manager.messageTimestamps.length,
@@ -935,9 +1253,22 @@ export function getMarketStreamHealth(): MarketStreamHealth {
     wsUpdatesApplied: manager.wsUpdatesApplied,
     snapshotUpdatesApplied: manager.snapshotUpdatesApplied,
     lastWsUpdateAt: manager.lastWsUpdateAt ? new Date(manager.lastWsUpdateAt).toISOString() : null,
+    lastTradeAt: manager.lastTradeAt ? new Date(manager.lastTradeAt).toISOString() : null,
+    lastAggregateAt: manager.lastAggregateAt ? new Date(manager.lastAggregateAt).toISOString() : null,
     lastSnapshotUpdateAt: manager.lastSnapshotUpdateAt ? new Date(manager.lastSnapshotUpdateAt).toISOString() : null,
     wsMessageSamples: [...manager.wsMessageSamples],
     statusOnlyStream: manager.wsMessagesReceived > 0 && manager.wsUpdatesApplied === 0,
+    aggregateUnauthorized: manager.aggregateUnauthorized,
+    appStartedAt: manager.appStartedAt ? new Date(manager.appStartedAt).toISOString() : null,
+    lastDiscoveryAt: manager.lastDiscoveryAt ? new Date(manager.lastDiscoveryAt).toISOString() : null,
+    lastDiscoveryStatus: manager.lastDiscoveryStatus,
+    lastUniverseCount: manager.lastUniverseCount,
+    startup: {
+      massiveKeyConfigured: manager.startupMassiveKeyConfigured,
+      discoveryAttempted: manager.startupDiscoveryAttempted,
+      websocketAttempted: manager.startupWebsocketAttempted,
+    },
+    degradedReason: manager.degradedReason,
   };
 }
 

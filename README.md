@@ -31,6 +31,12 @@ npm run build
 npm run start
 ```
 
+## Run tests
+
+```bash
+npm run test
+```
+
 ## Production-style live stream validation
 
 Run the app in production mode:
@@ -121,6 +127,26 @@ These are defined in the normalized model but are not emitted until a reliable s
 - If `OPENAI_API_KEY` is missing, analysis automatically falls back to deterministic rules output.
 - Optional model override: `OPENAI_MODEL` (default `gpt-4o-mini`).
 - AI is grounded on deterministic signal fields and cannot override ranking/scoring/freshness.
+
+## In-app support agent
+
+- Support agent backend runner lives in [lib/ai/support-agent.ts](/c:/Users/arung/Pulse_Grid/lib/ai/support-agent.ts).
+- Streaming chat route lives in [app/api/agent/support/route.ts](/c:/Users/arung/Pulse_Grid/app/api/agent/support/route.ts).
+- Chat UI panel lives in [components/support-agent-panel.tsx](/c:/Users/arung/Pulse_Grid/components/support-agent-panel.tsx).
+- The support agent defaults to `gpt-5.5` and can be overridden with `OPENAI_SUPPORT_AGENT_MODEL`.
+- API keys remain server-side only. The client calls the internal route and never receives `OPENAI_API_KEY`.
+- Multi-turn context is preserved in client conversation state and posted each turn to the server route.
+
+### Support agent setup
+
+1. Set `OPENAI_API_KEY` in `.env.local`.
+2. Optional: set `OPENAI_SUPPORT_AGENT_MODEL` (default `gpt-5.5`).
+3. Run `npm run dev` and open the PulseGrid Copilot panel at the bottom-right of the app.
+
+### Support agent tools
+
+- `get_live_session_overview`: returns session health/status plus top active signals.
+- `get_ticker_context`: returns per-ticker signal/watchlist/quote metadata context.
 
 ## V1 features
 

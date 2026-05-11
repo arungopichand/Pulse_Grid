@@ -58,40 +58,33 @@ export async function requestSignalAnalysis(
   }
 
   const requestPromise = (async () => {
-    try {
-      const response = await fetch("/api/analysis/signal", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        signal: options?.signal,
-        body: JSON.stringify({
-          features,
-        }),
-      });
+    const response = await fetch("/api/analysis/signal", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: options?.signal,
+      body: JSON.stringify({
+        features,
+      }),
+    });
 
-      if (!response.ok) {
-        writeClientCachedAnalysis(cacheKey, fallback);
-        return fallback;
-      }
-
-      const payload = (await response.json()) as {
-        ok?: boolean;
-        analysis?: Partial<SignalAnalysis>;
-      };
-
-      if (!payload.ok || !payload.analysis) {
-        writeClientCachedAnalysis(cacheKey, fallback);
-        return fallback;
-      }
-
-      const sanitized = sanitizeSignalAnalysis(payload.analysis, fallback, { features });
-      writeClientCachedAnalysis(cacheKey, sanitized);
-      return sanitized;
-    } catch {
-      writeClientCachedAnalysis(cacheKey, fallback);
-      return fallback;
+    if (!response.ok) {
+      throw new Error(`Signal analysis request failed with status ${response.status}.`);
     }
+
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      analysis?: Partial<SignalAnalysis>;
+    };
+
+    if (!payload.ok || !payload.analysis) {
+      throw new Error("Signal analysis response was incomplete.");
+    }
+
+    const sanitized = sanitizeSignalAnalysis(payload.analysis, fallback, { features });
+    writeClientCachedAnalysis(cacheKey, sanitized);
+    return sanitized;
   })();
 
   clientInFlight.set(cacheKey, requestPromise);

@@ -4,6 +4,9 @@ import {
   isMassiveErrorPayload,
   normalizeMassiveStockSnapshots,
 } from "./providers/massive";
+import type { RunnerAlert } from "./runner-alerts";
+import type { MomentumAlert } from "./active-now";
+import type { BotFeedItem } from "./bot-feed/types";
 
 export type MarketDataProvider = {
   name: string;
@@ -93,10 +96,13 @@ export type LiveSessionSnapshot =
       sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
       sessionLabel: string;
       signals: import("./live-signal-engine").Signal[];
+      alerts: RunnerAlert[];
       watchlist: import("./live-signal-engine").WatchlistQuote[];
       lastUpdated: string | null;
       persistence: import("./session-state-store").PersistenceStatus;
       events: import("./live-events").LiveEvent[];
+      liveAlertsNow: MomentumAlert[];
+      botFeed: BotFeedItem[];
       notifications: import("./live-events").LiveEvent[];
       volumeMovers: import("./volume-movers").VolumeMover[];
       volumeMoversMessage: string | null;
@@ -104,6 +110,74 @@ export type LiveSessionSnapshot =
       universeAdjusted?: boolean;
       universeMessage?: string | null;
       marketData?: QuoteFetchBase;
+      streamHealth?: {
+        connected: boolean;
+        reconnecting: boolean;
+        statusOnlyStream: boolean;
+        degraded: boolean;
+        degradedReason: string | null;
+        wsMessagesReceived: number;
+        wsUpdatesApplied: number;
+        lastMessageAt: string | null;
+        lastWsUpdateAt: string | null;
+      };
+      scannerDiagnostics?: {
+        massiveApiKeyConfigured: boolean;
+        universeSource: string;
+        activeUniverseCount: number;
+        discoveredCount: number;
+        selectedCount: number;
+        noQualifyingSymbols: boolean;
+        websocketConnected: boolean;
+        websocketAuthenticated: boolean | null;
+        websocketSubscribedCount: number;
+        websocketMessagesReceived: number;
+        websocketUpdatesApplied: number;
+        websocketDegradedReason: string | null;
+        quoteFresh: number;
+        quoteCached: number;
+        quoteStale: number;
+        quoteFailed: number;
+        primaryMessages: string[];
+        scannerThresholds?: {
+          minPrice: number;
+          maxPrice: number;
+          minVolume: number;
+          minRelativeVolume: number;
+          minAbsChangePercent: number;
+          bullishOnly: boolean;
+        };
+        discoveredBeforeFilters?: number;
+        rejectionReasonCounts?: Record<string, number>;
+        topCandidates?: Array<{
+          ticker: string;
+          price: number;
+          changePercent: number;
+          currentVolume: number;
+          relativeVolume: number | null;
+          reason: string;
+        }>;
+      };
+      diagnostics?: {
+        evaluatedSymbols: number;
+        candidateSignals: number;
+        emittedSignals: number;
+        topRejected: Array<{
+          ticker: string;
+          reason: string;
+          changePercent: number | null;
+          freshness: string;
+        }>;
+        sampleSnapshots: Array<{
+          ticker: string;
+          lastPrice: number | null;
+          windowStartPrice: number | null;
+          currentVolume: number | null;
+          averageVolume: number | null;
+          lastTradeTimestamp: string | null;
+          sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
+        }>;
+      };
     }
   | {
       ok: false;
@@ -114,10 +188,13 @@ export type LiveSessionSnapshot =
       sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
       sessionLabel: string;
       signals: import("./live-signal-engine").Signal[];
+      alerts: RunnerAlert[];
       watchlist: import("./live-signal-engine").WatchlistQuote[];
       lastUpdated: string | null;
       persistence: import("./session-state-store").PersistenceStatus;
       events: import("./live-events").LiveEvent[];
+      liveAlertsNow: MomentumAlert[];
+      botFeed: BotFeedItem[];
       notifications: import("./live-events").LiveEvent[];
       volumeMovers: import("./volume-movers").VolumeMover[];
       volumeMoversMessage: string | null;
@@ -125,6 +202,74 @@ export type LiveSessionSnapshot =
       universeAdjusted?: boolean;
       universeMessage?: string | null;
       marketData?: QuoteFetchBase;
+      streamHealth?: {
+        connected: boolean;
+        reconnecting: boolean;
+        statusOnlyStream: boolean;
+        degraded: boolean;
+        degradedReason: string | null;
+        wsMessagesReceived: number;
+        wsUpdatesApplied: number;
+        lastMessageAt: string | null;
+        lastWsUpdateAt: string | null;
+      };
+      scannerDiagnostics?: {
+        massiveApiKeyConfigured: boolean;
+        universeSource: string;
+        activeUniverseCount: number;
+        discoveredCount: number;
+        selectedCount: number;
+        noQualifyingSymbols: boolean;
+        websocketConnected: boolean;
+        websocketAuthenticated: boolean | null;
+        websocketSubscribedCount: number;
+        websocketMessagesReceived: number;
+        websocketUpdatesApplied: number;
+        websocketDegradedReason: string | null;
+        quoteFresh: number;
+        quoteCached: number;
+        quoteStale: number;
+        quoteFailed: number;
+        primaryMessages: string[];
+        scannerThresholds?: {
+          minPrice: number;
+          maxPrice: number;
+          minVolume: number;
+          minRelativeVolume: number;
+          minAbsChangePercent: number;
+          bullishOnly: boolean;
+        };
+        discoveredBeforeFilters?: number;
+        rejectionReasonCounts?: Record<string, number>;
+        topCandidates?: Array<{
+          ticker: string;
+          price: number;
+          changePercent: number;
+          currentVolume: number;
+          relativeVolume: number | null;
+          reason: string;
+        }>;
+      };
+      diagnostics?: {
+        evaluatedSymbols: number;
+        candidateSignals: number;
+        emittedSignals: number;
+        topRejected: Array<{
+          ticker: string;
+          reason: string;
+          changePercent: number | null;
+          freshness: string;
+        }>;
+        sampleSnapshots: Array<{
+          ticker: string;
+          lastPrice: number | null;
+          windowStartPrice: number | null;
+          currentVolume: number | null;
+          averageVolume: number | null;
+          lastTradeTimestamp: string | null;
+          sessionStatus: "premarket" | "regular" | "after-hours" | "closed";
+        }>;
+      };
     };
 
 type ProviderAttemptFailureReason =
@@ -1180,6 +1325,7 @@ export async function fetchLiveSessionSnapshot(options?: { signal?: AbortSignal 
       sessionStatus: "closed",
       sessionLabel: "Closed",
       signals: [],
+      alerts: [],
       watchlist: [],
       lastUpdated: null,
       persistence: {
@@ -1190,6 +1336,8 @@ export async function fetchLiveSessionSnapshot(options?: { signal?: AbortSignal 
         lastPersistedAt: null,
       },
       events: [],
+      liveAlertsNow: [],
+      botFeed: [],
       notifications: [],
       volumeMovers: [],
       volumeMoversMessage: "Volume Movers data is temporarily unavailable.",
