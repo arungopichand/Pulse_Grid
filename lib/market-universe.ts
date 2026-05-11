@@ -1,4 +1,5 @@
 import { getMassiveApiKey } from "./providers/massive";
+import { isCommonStockCandidate } from "./instrument-filter";
 import type { WatchlistTicker } from "./watchlist";
 
 type MassiveSnapshotBar = {
@@ -27,7 +28,8 @@ type UniverseRejectionReason =
   | "low_volume"
   | "low_relative_volume"
   | "low_change"
-  | "bearish_filtered";
+  | "bearish_filtered"
+  | "etf_or_fund";
 
 type DiscoveredTicker = {
   ticker: string;
@@ -58,6 +60,8 @@ export type DynamicMarketUniverseResult = {
     bullishOnly: boolean;
   };
   rejectionReasonCounts: Record<UniverseRejectionReason, number>;
+  etfRejectedCount?: number;
+  rejectedEtfSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -247,10 +251,17 @@ export async function getDynamicMarketUniverse(
     low_relative_volume: 0,
     low_change: 0,
     bearish_filtered: 0,
+    etf_or_fund: 0,
   };
+  const rejectedEtfSymbols: string[] = [];
 
   const passed: DiscoveredTicker[] = [];
   for (const row of dedupedRaw.values()) {
+    if (!isCommonStockCandidate({ ticker: row.ticker })) {
+      rejectionReasonCounts.etf_or_fund += 1;
+      if (rejectedEtfSymbols.length < 50) rejectedEtfSymbols.push(row.ticker);
+      continue;
+    }
     const rejection = validateEntry(row, scanner);
     if (rejection) {
       rejectionReasonCounts[rejection] += 1;
@@ -285,6 +296,8 @@ export async function getDynamicMarketUniverse(
       bullishOnly: scanner.bullishOnly,
     },
     rejectionReasonCounts,
+    etfRejectedCount: rejectionReasonCounts.etf_or_fund,
+    rejectedEtfSymbols: rejectedEtfSymbols.slice(0, 20),
     topCandidates: ranked.slice(0, 20).map((entry) => ({
       ticker: entry.ticker,
       price: entry.price,

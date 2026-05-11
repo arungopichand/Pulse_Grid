@@ -139,6 +139,9 @@ export type LiveSessionSnapshot =
         quoteStale: number;
         quoteFailed: number;
         primaryMessages: string[];
+        stocksOnly?: boolean;
+        etfRejectedCount?: number;
+        rejectedEtfSymbols?: string[];
         retainedUniverse?: boolean;
         retainedUniverseCount?: number;
         retainedSignalCount?: number;
@@ -240,6 +243,9 @@ export type LiveSessionSnapshot =
         quoteStale: number;
         quoteFailed: number;
         primaryMessages: string[];
+        stocksOnly?: boolean;
+        etfRejectedCount?: number;
+        rejectedEtfSymbols?: string[];
         retainedUniverse?: boolean;
         retainedUniverseCount?: number;
         retainedSignalCount?: number;

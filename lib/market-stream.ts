@@ -1,5 +1,6 @@
 import { fetchMassiveRecentIntradayForSymbols, fetchMassiveStockSnapshots, getMassiveApiKey } from "./providers/massive";
 import { getDynamicMarketUniverse } from "./market-universe";
+import { isCommonStockCandidate } from "./instrument-filter";
 import type { QuoteFetchResult, QuoteSnapshot, QuoteState, QuoteFetchSummary, QuoteFreshness } from "./market-data";
 import { consumeRateLimitToken } from "./request-rate-limiter";
 import { getSignalRuntimeConfig } from "./signal-runtime-config";
@@ -128,6 +129,8 @@ type DynamicUniverseState = {
     bullishOnly: boolean;
   };
   rejectionReasonCounts: Record<string, number>;
+  etfRejectedCount?: number;
+  rejectedEtfSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -228,6 +231,8 @@ function createManager(): MarketStreamManager {
         bullishOnly: false,
       },
       rejectionReasonCounts: {},
+      etfRejectedCount: 0,
+      rejectedEtfSymbols: [],
       topCandidates: [],
     },
     streamSocket: null,
@@ -812,8 +817,15 @@ async function refreshUniverse() {
   const discovered = await getDynamicMarketUniverse({
     cap: runtimeConfig.maxSymbolsPerScan,
   });
-  const useEmptyFallback = discovered.candidates.length === 0;
-  const candidates = useEmptyFallback ? [] : discovered.candidates;
+  const stockOnlyCandidates = discovered.candidates.filter((candidate) =>
+    isCommonStockCandidate({
+      ticker: candidate.ticker,
+      instrumentType: candidate.instrumentType,
+      company: candidate.company,
+    }),
+  );
+  const useEmptyFallback = stockOnlyCandidates.length === 0;
+  const candidates = useEmptyFallback ? [] : stockOnlyCandidates;
   const source = useEmptyFallback ? "fallback_empty" : discovered.source;
   const reasonsBySymbol = useEmptyFallback
     ? { __universe__: "No low-price bullish momentum symbols matched current scanner filters." }
@@ -831,6 +843,8 @@ async function refreshUniverse() {
     discoveredBeforeFilters: discovered.discoveredBeforeFilters,
     scannerThresholds: discovered.scannerThresholds,
     rejectionReasonCounts: discovered.rejectionReasonCounts,
+    etfRejectedCount: discovered.etfRejectedCount ?? 0,
+    rejectedEtfSymbols: discovered.rejectedEtfSymbols ?? [],
     topCandidates: discovered.topCandidates,
   };
   manager.lastUniverseCount = candidates.length;
@@ -1168,6 +1182,8 @@ export function getDynamicUniverse() {
     discoveredBeforeFilters: manager.dynamicUniverse.discoveredBeforeFilters,
     scannerThresholds: manager.dynamicUniverse.scannerThresholds,
     rejectionReasonCounts: manager.dynamicUniverse.rejectionReasonCounts,
+    etfRejectedCount: manager.dynamicUniverse.etfRejectedCount ?? 0,
+    rejectedEtfSymbols: manager.dynamicUniverse.rejectedEtfSymbols ?? [],
     topCandidates: manager.dynamicUniverse.topCandidates,
   };
 }

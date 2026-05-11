@@ -22,6 +22,9 @@ type DebugPayload = {
     quoteStale: number;
     quoteFailed: number;
     primaryMessages: string[];
+    stocksOnly?: boolean;
+    etfRejectedCount?: number;
+    rejectedEtfSymbols?: string[];
     retainedUniverse?: boolean;
     retainedUniverseCount?: number;
     retainedSignalCount?: number;
@@ -129,6 +132,10 @@ type DebugPayload = {
   dynamicUniverse: {
     source: string;
     topSymbols: string[];
+    stocksOnly?: boolean;
+    etfRejectedCount?: number;
+    rejectedEtfSymbols?: string[];
+    activeUniverseTickers?: string[];
   };
 };
 
@@ -187,6 +194,8 @@ export default function MonitoringPage() {
         <div className="rounded border border-white/10 p-3">WS Messages: {d?.websocketMessagesReceived ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">WS Updates: {d?.websocketUpdatesApplied ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Universe Source: {d?.universeSource ?? "n/a"}</div>
+        <div className="rounded border border-white/10 p-3">Stocks Only: {String(d?.stocksOnly ?? payload?.dynamicUniverse?.stocksOnly ?? true)}</div>
+        <div className="rounded border border-white/10 p-3">ETF Rejected Count: {d?.etfRejectedCount ?? payload?.dynamicUniverse?.etfRejectedCount ?? 0}</div>
         <div className="rounded border border-white/10 p-3">Discovered Before Filters: {d?.discoveredBeforeFilters ?? "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Universe: {d ? `${d.selectedCount} selected / ${d.discoveredCount} discovered` : "n/a"}</div>
         <div className="rounded border border-white/10 p-3">Active Universe: {d?.activeUniverseCount ?? "n/a"}</div>
@@ -287,7 +296,8 @@ export default function MonitoringPage() {
 
       <section className="mt-6">
         <h2 className="text-sm font-semibold uppercase tracking-[0.15em] text-slate-400">Active Universe Tickers</h2>
-        <p className="mt-2 text-sm text-slate-300">{payload?.dynamicUniverse?.topSymbols?.join(", ") || "none"}</p>
+        <p className="mt-2 text-sm text-slate-300">{payload?.dynamicUniverse?.activeUniverseTickers?.join(", ") || payload?.dynamicUniverse?.topSymbols?.join(", ") || "none"}</p>
+        <p className="mt-2 text-sm text-slate-300">Rejected ETF symbols: {(d?.rejectedEtfSymbols ?? payload?.dynamicUniverse?.rejectedEtfSymbols ?? []).slice(0, 20).join(", ") || "none"}</p>
       </section>
 
       <section className="mt-6">

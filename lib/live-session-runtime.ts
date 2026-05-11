@@ -23,6 +23,7 @@ import {
   startMarketStream,
 } from "./market-stream";
 import { getMassiveApiKey } from "./providers/massive";
+import { isCommonStockCandidate } from "./instrument-filter";
 import type { RunnerAlert } from "./runner-alerts";
 import type { WatchlistTicker } from "./watchlist";
 
@@ -115,6 +116,8 @@ let cachedUniverseDiscovery: {
     bullishOnly: boolean;
   };
   rejectionReasonCounts: Record<string, number>;
+  etfRejectedCount?: number;
+  rejectedEtfSymbols?: string[];
   topCandidates: Array<{
     ticker: string;
     price: number;
@@ -139,6 +142,8 @@ let cachedUniverseDiscovery: {
     bullishOnly: false,
   },
   rejectionReasonCounts: {},
+  etfRejectedCount: 0,
+  rejectedEtfSymbols: [],
   topCandidates: [],
 };
 let nextUniverseRefreshAt = 0;
@@ -870,6 +875,8 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
       reasonsBySymbol: canRetainUniverse ? { __universe__: "Retained previous active universe while waiting for next discovery refresh." } : dynamicUniverse.reasonsBySymbol,
       scannerThresholds: dynamicUniverse.scannerThresholds,
       rejectionReasonCounts: dynamicUniverse.rejectionReasonCounts,
+      etfRejectedCount: dynamicUniverse.etfRejectedCount ?? 0,
+      rejectedEtfSymbols: dynamicUniverse.rejectedEtfSymbols ?? [],
       topCandidates: dynamicUniverse.topCandidates,
     };
     nextUniverseRefreshAt = Date.now() + runtimeConfig.universeRefreshMs;
@@ -885,7 +892,13 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     discoveredCandidates,
     runtimeConfig.maxSymbolsPerScan,
   );
-  const activeUniverse = universeSelection.activeUniverse;
+  const activeUniverse = universeSelection.activeUniverse.filter((candidate) =>
+    isCommonStockCandidate({
+      ticker: candidate.ticker,
+      instrumentType: candidate.instrumentType,
+      company: candidate.company,
+    }),
+  );
   const activeTickers = activeUniverse.map((ticker) => ticker.ticker);
   console.log("[live-session-runtime] scanning universe", {
     activeSymbols: activeTickers.length,
@@ -998,6 +1011,9 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
     quoteStale: quotesResult.summary.stale,
     quoteFailed: quotesResult.summary.failed,
     primaryMessages,
+    stocksOnly: true,
+    etfRejectedCount: cachedUniverseDiscovery.etfRejectedCount ?? 0,
+    rejectedEtfSymbols: cachedUniverseDiscovery.rejectedEtfSymbols ?? [],
     retainedUniverse: cachedUniverseDiscovery.source === "retained_previous",
     retainedUniverseCount: cachedUniverseDiscovery.source === "retained_previous" ? cachedUniverseCandidates.length : 0,
     retainedSignalCount: 0 as number,
@@ -1203,6 +1219,9 @@ async function runLiveSessionCycle(): Promise<LiveSessionSnapshot> {
 
   const alerts: RunnerAlert[] = [];
   for (const signal of [...activeSignals, ...volumeSpikeOnlyCandidates]) {
+    if (!isCommonStockCandidate({ ticker: signal.ticker, instrumentType: signal.instrumentType, company: signal.company })) {
+      continue;
+    }
     const prior = runnerAlertStateByTicker.get(signal.ticker) ?? {
       ticker: signal.ticker,
       sessionDate: marketClock.sessionDate,
