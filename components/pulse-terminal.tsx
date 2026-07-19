@@ -1,41 +1,58 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { fetchLiveSessionSnapshot, type LiveSessionSnapshot } from "@/lib/market-data";
 import type { BotFeedItem } from "@/lib/bot-feed/types";
+import { fetchLiveSessionSnapshot, type LiveSessionSnapshot } from "@/lib/market-data";
 import type { RunnerAlert } from "@/lib/runner-alerts";
 
-type Channel = "all" | "movers" | "halts" | "catalysts" | "watchlist";
-type FeedKind = "momentum" | "halt" | "news" | "filing" | "summary" | "session";
+type Channel = "main" | "momentum" | "halts" | "catalysts" | "gainers" | "watchlist";
+type ChatKind = "momentum" | "halt" | "news" | "filing" | "summary" | "session";
+type ChatBot = "pulse" | "wire" | "filings";
 
-type TerminalItem = {
+type ChatItem = {
   id: string;
+  dedupeKey: string;
   timestamp: string;
   timeLabel: string;
+  bot: ChatBot;
+  kind: ChatKind;
   ticker: string | null;
-  kind: FeedKind;
-  title: string;
+  direction: "up" | "down" | null;
+  priceBucket: string | null;
+  movePercent: number | null;
+  occurrenceCount: number | null;
+  label: string;
   detail: string;
   metadata: string[];
-  movePercent: number | null;
-  price: number | null;
+  priceLabel: string | null;
   priority: "critical" | "high" | "medium" | "low";
 };
 
-const CHANNELS: Array<{ id: Channel; label: string; icon: string }> = [
-  { id: "all", label: "Live tape", icon: "⌁" },
-  { id: "movers", label: "Momentum", icon: "↗" },
-  { id: "halts", label: "Halts", icon: "Ⅱ" },
-  { id: "catalysts", label: "Catalysts", icon: "✦" },
-  { id: "watchlist", label: "Watchlist", icon: "☆" },
+type ChatGroup = {
+  id: string;
+  bot: ChatBot;
+  timestamp: string;
+  items: ChatItem[];
+};
+
+const CHANNELS: Array<{ id: Channel; label: string; icon: string; section: "scanner" | "tables" }> = [
+  { id: "main", label: "main-chat", icon: "🌿", section: "scanner" },
+  { id: "momentum", label: "momentum-spikes", icon: "⚡", section: "scanner" },
+  { id: "halts", label: "halts", icon: "⏸", section: "scanner" },
+  { id: "catalysts", label: "catalysts", icon: "📰", section: "scanner" },
+  { id: "gainers", label: "gainers", icon: "📈", section: "tables" },
+  { id: "watchlist", label: "watchlist", icon: "⭐", section: "tables" },
 ];
+
+const BOT_DETAILS: Record<ChatBot, { name: string; avatarLabel: string; tone: string }> = {
+  pulse: { name: "PulseBot", avatarLabel: "PG", tone: "pulse" },
+  wire: { name: "MarketWire", avatarLabel: "MW", tone: "wire" },
+  filings: { name: "FilingsBot", avatarLabel: "SEC", tone: "filings" },
+};
 
 function compactNumber(value: number | null | undefined) {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat("en-US", {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(value);
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 function formatPrice(value: number | null | undefined) {
@@ -49,14 +66,32 @@ function formatMove(value: number | null | undefined) {
   return `${value >= 0 ? "+" : ""}${value.toFixed(Math.abs(value) >= 100 ? 0 : 1)}%`;
 }
 
-function marketTime(timestamp: string) {
+function marketTime(timestamp: string, withSeconds = false) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit",
+    second: withSeconds ? "2-digit" : undefined,
     hour12: false,
   }).format(new Date(timestamp));
+}
+
+function groupTimestamp(timestamp: string) {
+  const date = new Date(timestamp);
+  const dateFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+  });
+  const currentDay = dateFormatter.format(new Date());
+  const itemDay = dateFormatter.format(date);
+  const clock = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(date);
+  return itemDay === currentDay ? `Today at ${clock}` : `${itemDay} at ${clock}`;
 }
 
 function countryFlag(code: string | null) {
@@ -69,8 +104,8 @@ function countryFlag(code: string | null) {
 }
 
 function priceBucket(price: number | null) {
-  if (price === null) return "";
-  if (price < 0.5) return "< $0.50";
+  if (price === null) return null;
+  if (price < 0.5) return "< $.50c";
   if (price < 1) return "< $1";
   if (price < 2) return "< $2";
   if (price < 5) return "< $5";
@@ -79,211 +114,322 @@ function priceBucket(price: number | null) {
   return formatPrice(price);
 }
 
-function alertKind(alert: RunnerAlert): FeedKind {
-  if (alert.alertType.startsWith("HALTED") || alert.alertType === "NEWS_PENDING_HALT") return "halt";
-  if (alert.source === "news" || alert.alertType === "PR_SPIKE") return "news";
-  return "momentum";
-}
-
-function alertToItem(alert: RunnerAlert): TerminalItem {
-  const kind = alertKind(alert);
-  const metadata = [
-    countryFlag(alert.countryCode),
-    alert.floatShares ? `Float ${compactNumber(alert.floatShares)}` : null,
-    alert.relativeVolume ? `RVol ${alert.relativeVolume.toFixed(1)}x` : null,
-    alert.currentVolume ? `Vol ${compactNumber(alert.currentVolume)}` : null,
-    alert.shortInterestPercent ? `SI ${alert.shortInterestPercent.toFixed(1)}%` : null,
-    alert.marketCap ? `MC ${compactNumber(alert.marketCap)}` : null,
-    alert.highCostToBorrow ? "High CTB" : null,
-  ].filter((part): part is string => Boolean(part));
-
-  const label = alert.alertType
+function normalizeLabel(value: string) {
+  return value
     .replace("HALTED_UP", "Halted UP")
     .replace("HALTED_DOWN", "Halted DOWN")
     .replace("VOLUME_SPIKE", "Volume spike")
     .replace("GREEN_BARS", "3 green bars")
     .replace("PR_SPIKE", "PR spike")
     .replaceAll("_", " ");
-
-  return {
-    id: alert.id,
-    timestamp: alert.timestamp,
-    timeLabel: alert.alertTime || marketTime(alert.timestamp),
-    ticker: alert.ticker,
-    kind,
-    title: label,
-    detail: alert.newsHeadline || alert.reason,
-    metadata,
-    movePercent: alert.changePercent,
-    price: alert.tickerPrice,
-    priority: kind === "halt" ? "critical" : alert.score >= 85 ? "high" : alert.score >= 70 ? "medium" : "low",
-  };
 }
 
-function botItemToTerminal(item: BotFeedItem): TerminalItem {
+function botItemToChat(item: BotFeedItem): ChatItem | null {
+  if (item.type === "source_header") return null;
+
   if (item.type === "momentum_alert") {
     return {
       id: item.id,
+      dedupeKey: item.dedupeKey,
       timestamp: item.timestamp,
       timeLabel: item.timeLabel,
-      ticker: item.ticker,
+      bot: "pulse",
       kind: "momentum",
-      title: item.label,
+      ticker: item.ticker,
+      direction: item.direction,
+      priceBucket: item.priceBucketLabel,
+      movePercent: item.movePercent,
+      occurrenceCount: item.occurrenceCount,
+      label: item.label,
       detail: item.whyNow,
       metadata: item.metadataParts,
-      movePercent: item.movePercent,
-      price: null,
+      priceLabel: null,
       priority: item.priority,
     };
   }
+
   if (item.type === "halt_alert") {
     return {
       id: item.id,
+      dedupeKey: item.dedupeKey,
       timestamp: item.timestamp,
       timeLabel: item.timeLabel,
-      ticker: item.ticker,
+      bot: "pulse",
       kind: "halt",
-      title: item.haltDirection === "HALTED" ? "Resumption watch" : `Halted ${item.haltDirection}`,
-      detail: item.reasonLabel || "Volatility halt",
-      metadata: [item.priceLabel, ...item.metadataParts].filter((part): part is string => Boolean(part)),
+      ticker: item.ticker,
+      direction: item.haltDirection === "DOWN" ? "down" : "up",
+      priceBucket: null,
       movePercent: null,
-      price: null,
+      occurrenceCount: null,
+      label: item.haltDirection === "HALTED" ? "Resumption Watch" : `Halted ${item.haltDirection}`,
+      detail: item.reasonLabel || "Volatility",
+      metadata: item.metadataParts,
+      priceLabel: item.priceLabel || null,
       priority: "critical",
     };
   }
+
   if (item.type === "symbol_news") {
     return {
       id: item.id,
+      dedupeKey: item.dedupeKey,
       timestamp: item.timestamp,
       timeLabel: item.timeLabel,
-      ticker: item.ticker,
+      bot: "wire",
       kind: "news",
-      title: item.label,
+      ticker: item.ticker,
+      direction: null,
+      priceBucket: item.priceBucketLabel || null,
+      movePercent: null,
+      occurrenceCount: null,
+      label: item.label,
       detail: item.headline,
       metadata: item.metadataParts,
-      movePercent: null,
-      price: null,
+      priceLabel: null,
       priority: item.priority,
     };
   }
+
   if (item.type === "sec_filing") {
     return {
       id: item.id,
+      dedupeKey: item.dedupeKey,
       timestamp: item.timestamp,
       timeLabel: item.timeLabel,
-      ticker: item.ticker,
+      bot: "filings",
       kind: "filing",
-      title: item.formLabel,
+      ticker: item.ticker,
+      direction: null,
+      priceBucket: null,
+      movePercent: null,
+      occurrenceCount: null,
+      label: item.formLabel,
       detail: item.linkText,
       metadata: ["SEC filing"],
-      movePercent: null,
-      price: null,
+      priceLabel: null,
       priority: item.priority,
     };
   }
+
   if (item.type === "top_gainer_summary") {
     return {
       id: item.id,
+      dedupeKey: item.dedupeKey,
       timestamp: item.timestamp,
       timeLabel: item.timeLabel,
-      ticker: null,
+      bot: "pulse",
       kind: "summary",
-      title: "Top gainers",
+      ticker: null,
+      direction: null,
+      priceBucket: null,
+      movePercent: null,
+      occurrenceCount: null,
+      label: "Top Gainers",
       detail: item.summaryText,
       metadata: item.symbols,
-      movePercent: null,
-      price: null,
+      priceLabel: null,
       priority: item.priority,
     };
   }
+
   return {
     id: item.id,
+    dedupeKey: item.dedupeKey,
     timestamp: item.timestamp,
     timeLabel: item.timeLabel,
+    bot: "pulse",
+    kind: item.type === "summary_event" ? "summary" : "session",
     ticker: null,
-    kind: "session",
-    title: item.type === "source_header" ? item.source : item.label,
-    detail: item.type === "source_header" ? item.subLabel || "Live scanner source" : item.detail,
-    metadata: [],
+    direction: null,
+    priceBucket: null,
     movePercent: null,
-    price: null,
+    occurrenceCount: null,
+    label: item.label,
+    detail: item.detail,
+    metadata: [],
+    priceLabel: null,
     priority: item.priority,
   };
 }
 
-function itemMatchesChannel(item: TerminalItem, channel: Channel, watchlist: Set<string>) {
-  if (channel === "all") return true;
-  if (channel === "movers") return item.kind === "momentum" || item.kind === "summary";
+function alertToChat(alert: RunnerAlert): ChatItem {
+  const isHalt = alert.alertType.startsWith("HALTED") || alert.alertType === "NEWS_PENDING_HALT";
+  const isNews = alert.source === "news" || alert.alertType === "PR_SPIKE";
+  const kind: ChatKind = isHalt ? "halt" : isNews ? "news" : "momentum";
+  const metadata = [
+    countryFlag(alert.countryCode),
+    alert.floatShares ? `Float: ${compactNumber(alert.floatShares)}` : null,
+    alert.relativeVolume ? `RVol: ${alert.relativeVolume.toFixed(1)}x` : null,
+    alert.currentVolume ? `Vol: ${compactNumber(alert.currentVolume)}` : null,
+    alert.shortInterestPercent ? `SI: ${alert.shortInterestPercent.toFixed(1)}%` : null,
+    alert.marketCap ? `MC: ${compactNumber(alert.marketCap)}` : null,
+    alert.highCostToBorrow ? "High CTB" : null,
+  ].filter((part): part is string => Boolean(part));
+
+  return {
+    id: `runner-${alert.id}`,
+    dedupeKey: `runner|${alert.ticker}|${alert.alertType}|${alert.alertCountToday ?? 1}`,
+    timestamp: alert.timestamp,
+    timeLabel: alert.alertTime || marketTime(alert.timestamp, isHalt),
+    bot: isNews ? "wire" : "pulse",
+    kind,
+    ticker: alert.ticker,
+    direction: (alert.changePercent ?? 0) >= 0 ? "up" : "down",
+    priceBucket: priceBucket(alert.tickerPrice),
+    movePercent: alert.changePercent,
+    occurrenceCount: alert.alertCountToday ?? 1,
+    label: normalizeLabel(alert.alertType),
+    detail: alert.newsHeadline || alert.reason,
+    metadata,
+    priceLabel: isHalt ? formatPrice(alert.tickerPrice) : null,
+    priority: isHalt ? "critical" : alert.score >= 85 ? "high" : alert.score >= 70 ? "medium" : "low",
+  };
+}
+
+function dedupeChatItems(items: ChatItem[]) {
+  const byKey = new Map<string, ChatItem>();
+  for (const item of [...items].sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())) {
+    byKey.set(item.dedupeKey, item);
+  }
+  return [...byKey.values()]
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())
+    .slice(-100);
+}
+
+function buildChatGroups(items: ChatItem[]): ChatGroup[] {
+  const groups: ChatGroup[] = [];
+  for (const item of items) {
+    const previous = groups[groups.length - 1];
+    const gapMs = previous ? new Date(item.timestamp).getTime() - new Date(previous.timestamp).getTime() : Number.POSITIVE_INFINITY;
+    const canJoin = previous && previous.bot === item.bot && gapMs < 12 * 60_000 && previous.items.length < 9 && item.kind !== "session";
+    if (canJoin) {
+      previous.items.push(item);
+    } else {
+      groups.push({ id: `chat-group-${item.id}`, bot: item.bot, timestamp: item.timestamp, items: [item] });
+    }
+  }
+  return groups;
+}
+
+function matchesChannel(item: ChatItem, channel: Channel, watchlist: Set<string>) {
+  if (channel === "main") return true;
+  if (channel === "momentum") return item.kind === "momentum";
   if (channel === "halts") return item.kind === "halt";
   if (channel === "catalysts") return item.kind === "news" || item.kind === "filing";
+  if (channel === "gainers") return item.kind === "summary" || (item.kind === "momentum" && (item.movePercent ?? 0) > 0);
   return Boolean(item.ticker && watchlist.has(item.ticker));
 }
 
-function ChannelIcon({ value }: { value: string }) {
-  return <span className="inline-flex h-6 w-6 items-center justify-center text-base text-slate-500">{value}</span>;
-}
-
-function ActivityIcon({ kind }: { kind: FeedKind }) {
-  const value = kind === "halt" ? "Ⅱ" : kind === "news" ? "✦" : kind === "filing" ? "§" : kind === "summary" ? "≋" : kind === "session" ? "◷" : "↗";
-  return <span className={`activity-icon activity-icon-${kind}`}>{value}</span>;
-}
-
-function FeedRow({ item, onSelect }: { item: TerminalItem; onSelect: (ticker: string) => void }) {
-  const rising = (item.movePercent ?? 0) >= 0;
+function MetadataParts({ parts }: { parts: string[] }) {
+  if (!parts.length) return null;
   return (
-    <button
-      type="button"
-      onClick={() => item.ticker && onSelect(item.ticker)}
-      className={`terminal-row group ${item.priority === "critical" ? "terminal-row-critical" : ""}`}
-      disabled={!item.ticker}
-    >
-      <ActivityIcon kind={item.kind} />
-      <span className="terminal-time">{item.timeLabel}</span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          {item.ticker ? <span className="ticker-symbol">{item.ticker}</span> : null}
-          {item.price !== null ? <span className="price-bucket">{priceBucket(item.price)}</span> : null}
-          {item.movePercent !== null ? (
-            <span className={rising ? "move-up" : "move-down"}>{formatMove(item.movePercent)}</span>
-          ) : null}
-          <span className={`event-pill event-pill-${item.kind}`}>{item.title}</span>
-          {item.metadata.map((part, index) => (
-            <span key={`${part}-${index}`} className="metadata-part">
-              {part}
-            </span>
-          ))}
-        </div>
-        {item.detail ? <p className="mt-1.5 line-clamp-2 text-left text-[13px] leading-5 text-slate-400">{item.detail}</p> : null}
-      </div>
-      {item.ticker ? <span className="row-chevron">›</span> : null}
-    </button>
+    <>
+      {parts.map((part, index) => (
+        <span className="nuntio-meta" key={`${part}-${index}`}>
+          <span aria-hidden="true">|</span> {part}
+        </span>
+      ))}
+    </>
   );
 }
 
-function MetricCard({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: "green" | "amber" | "blue" }) {
-  return (
-    <div className="metric-card">
-      <div className="flex items-center justify-between gap-3">
-        <span className="metric-label">{label}</span>
-        <span className={`metric-dot metric-dot-${tone || "blue"}`} />
+function ChatRow({ item, onSelect }: { item: ChatItem; onSelect: (ticker: string) => void }) {
+  if (item.kind === "momentum") {
+    return (
+      <button type="button" className="nuntio-alert-line" onClick={() => item.ticker && onSelect(item.ticker)}>
+        <span className="nuntio-time-token">{item.timeLabel}</span>
+        <span className={`nuntio-arrow nuntio-arrow-${item.direction}`}>{item.direction === "down" ? "↓" : "↑"}</span>
+        <strong className="nuntio-ticker">{item.ticker}</strong>
+        {item.priceBucket ? <span className="nuntio-price-bucket">{item.priceBucket}</span> : null}
+        {item.movePercent !== null ? <span className={`nuntio-move nuntio-move-${item.direction}`}>{Math.abs(item.movePercent).toFixed(Math.abs(item.movePercent) >= 100 ? 0 : 0)}%</span> : null}
+        {item.occurrenceCount ? <span className="nuntio-occurrence">· {item.occurrenceCount}</span> : null}
+        <span className="nuntio-event-tag">{item.label}</span>
+        <span className="nuntio-tilde">~</span>
+        <MetadataParts parts={item.metadata} />
+        {item.detail ? <span className="nuntio-why">{item.detail}</span> : null}
+      </button>
+    );
+  }
+
+  if (item.kind === "halt") {
+    return (
+      <button type="button" className="nuntio-alert-line nuntio-halt-line" onClick={() => item.ticker && onSelect(item.ticker)}>
+        <span className="nuntio-time-token">{item.timeLabel}</span>
+        <strong className="nuntio-ticker">{item.ticker}</strong>
+        <span className={`nuntio-halt-tag nuntio-halt-${item.direction}`}>{item.label}</span>
+        <span className="nuntio-meta-plain">| {item.detail}</span>
+        {item.priceLabel ? <span className="nuntio-halt-price">→ {item.priceLabel}</span> : null}
+        <MetadataParts parts={item.metadata} />
+      </button>
+    );
+  }
+
+  if (item.kind === "news" || item.kind === "filing") {
+    return (
+      <button type="button" className="nuntio-context-line" onClick={() => item.ticker && onSelect(item.ticker)}>
+        <div className="nuntio-context-heading">
+          <span className="nuntio-time-muted">{item.timeLabel}</span>
+          <strong className="nuntio-ticker">{item.ticker}</strong>
+          {item.priceBucket ? <span className="nuntio-price-bucket">{item.priceBucket}</span> : null}
+          <span className={`nuntio-context-tag nuntio-context-${item.kind}`}>{item.label}</span>
+          <span className="nuntio-link-label">Link ↗</span>
+        </div>
+        <div className="nuntio-context-copy">
+          <span>{item.detail}</span>
+          <MetadataParts parts={item.metadata} />
+        </div>
+      </button>
+    );
+  }
+
+  if (item.kind === "summary") {
+    return (
+      <div className="nuntio-summary-card">
+        <div className="nuntio-summary-title"><span>{item.timeLabel}</span>{item.label}</div>
+        <p>{item.detail}</p>
+        {item.metadata.length ? <div className="nuntio-summary-symbols">{item.metadata.map((symbol) => <span key={symbol}>{symbol}</span>)}</div> : null}
       </div>
-      <p className="mt-3 text-2xl font-semibold tracking-tight text-white">{value}</p>
-      <p className="mt-1 truncate text-xs text-slate-500">{detail}</p>
+    );
+  }
+
+  return (
+    <div className="nuntio-session-card">
+      <div><span className="nuntio-time-muted">{item.timeLabel}</span><strong>{item.label}</strong></div>
+      <p>{item.detail}</p>
     </div>
+  );
+}
+
+function ChatMessageGroup({ group, onSelect }: { group: ChatGroup; onSelect: (ticker: string) => void }) {
+  const bot = BOT_DETAILS[group.bot];
+  return (
+    <article className="nuntio-message-group">
+      <div className={`nuntio-bot-avatar nuntio-bot-${bot.tone}`} aria-hidden="true">
+        {group.bot === "pulse" ? <span className="nuntio-dot-grid"><i /><i /><i /><i /><i /><i /><i /></span> : bot.avatarLabel}
+      </div>
+      <div className="nuntio-message-content">
+        <header className="nuntio-message-author">
+          <strong>{bot.name}</strong>
+          <span className="nuntio-app-badge">APP</span>
+          <time dateTime={group.timestamp}>{groupTimestamp(group.timestamp)}</time>
+        </header>
+        <div className="nuntio-message-lines">
+          {group.items.map((item) => <ChatRow key={item.id} item={item} onSelect={onSelect} />)}
+        </div>
+      </div>
+    </article>
   );
 }
 
 export function PulseTerminal() {
   const [snapshot, setSnapshot] = useState<LiveSessionSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [channel, setChannel] = useState<Channel>("all");
+  const [channel, setChannel] = useState<Channel>("main");
   const [query, setQuery] = useState("");
-  const [minMove, setMinMove] = useState(0);
-  const [maxPrice, setMaxPrice] = useState(20);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [now, setNow] = useState(Date.now());
   const [liveConnected, setLiveConnected] = useState<boolean | null>(null);
+  const [now, setNow] = useState(Date.now());
 
   const applySnapshot = useCallback((next: LiveSessionSnapshot) => {
     setSnapshot(next);
@@ -297,21 +443,27 @@ export function PulseTerminal() {
     const controller = new AbortController();
 
     async function connect() {
-      const initial = await fetchLiveSessionSnapshot({ signal: controller.signal });
-      if (!active) return;
-      applySnapshot(initial);
-
-      eventSource = new EventSource("/api/live-session/events");
-      eventSource.addEventListener("snapshot", (event) => {
+      try {
+        const initial = await fetchLiveSessionSnapshot({ signal: controller.signal });
         if (!active) return;
-        try {
-          applySnapshot(JSON.parse((event as MessageEvent<string>).data) as LiveSessionSnapshot);
-        } catch {
+        applySnapshot(initial);
+        eventSource = new EventSource("/api/live-session/events");
+        eventSource.addEventListener("snapshot", (event) => {
+          if (!active) return;
+          try {
+            applySnapshot(JSON.parse((event as MessageEvent<string>).data) as LiveSessionSnapshot);
+          } catch {
+            setLiveConnected(false);
+          }
+        });
+        eventSource.onopen = () => setLiveConnected(true);
+        eventSource.onerror = () => setLiveConnected(false);
+      } catch {
+        if (active && !controller.signal.aborted) {
+          setLoading(false);
           setLiveConnected(false);
         }
-      });
-      eventSource.onopen = () => setLiveConnected(true);
-      eventSource.onerror = () => setLiveConnected(false);
+      }
     }
 
     void connect();
@@ -329,190 +481,158 @@ export function PulseTerminal() {
 
   const alerts = useMemo(() => snapshot?.alerts.filter((alert) => alert.alertType !== "TEST") ?? [], [snapshot]);
   const watchlistSet = useMemo(() => new Set(snapshot?.watchlist.map((item) => item.ticker) ?? []), [snapshot]);
-  const items = useMemo(() => {
-    const source = snapshot?.botFeed.length ? snapshot.botFeed.map(botItemToTerminal) : alerts.map(alertToItem);
-    return source.sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime());
+  const chatItems = useMemo(() => {
+    const normalizedBotItems = (snapshot?.botFeed ?? []).map(botItemToChat).filter((item): item is ChatItem => Boolean(item));
+    const hasActionableBotRows = normalizedBotItems.some((item) => item.kind !== "session" && item.kind !== "summary");
+    const fallbackAlerts = hasActionableBotRows ? [] : alerts.map(alertToChat);
+    return dedupeChatItems([...normalizedBotItems, ...fallbackAlerts]);
   }, [alerts, snapshot]);
 
   const visibleItems = useMemo(() => {
-    const normalizedQuery = query.trim().toUpperCase();
-    return items.filter((item) => {
-      if (!itemMatchesChannel(item, channel, watchlistSet)) return false;
-      if (item.movePercent !== null && Math.abs(item.movePercent) < minMove) return false;
-      if (item.price !== null && item.price > maxPrice) return false;
-      if (normalizedQuery && !`${item.ticker ?? ""} ${item.title} ${item.detail} ${item.metadata.join(" ")}`.toUpperCase().includes(normalizedQuery)) return false;
-      return true;
+    const needle = query.trim().toUpperCase();
+    return chatItems.filter((item) => {
+      if (!matchesChannel(item, channel, watchlistSet)) return false;
+      if (!needle) return true;
+      return `${item.ticker ?? ""} ${item.label} ${item.detail} ${item.metadata.join(" ")}`.toUpperCase().includes(needle);
     });
-  }, [channel, items, maxPrice, minMove, query, watchlistSet]);
+  }, [channel, chatItems, query, watchlistSet]);
 
-  const topMovers = useMemo(
-    () => [...alerts].filter((alert) => alert.changePercent !== null).sort((a, b) => (b.changePercent ?? 0) - (a.changePercent ?? 0)).slice(0, 6),
-    [alerts],
-  );
-  const topMover = topMovers[0] ?? null;
+  const groups = useMemo(() => buildChatGroups(visibleItems), [visibleItems]);
+  const counts = useMemo(() => Object.fromEntries(CHANNELS.map((entry) => [entry.id, chatItems.filter((item) => matchesChannel(item, entry.id, watchlistSet)).length])) as Record<Channel, number>, [chatItems, watchlistSet]);
+  const currentChannel = CHANNELS.find((entry) => entry.id === channel) ?? CHANNELS[0];
   const selectedAlert = alerts.find((alert) => alert.ticker === selectedTicker) ?? null;
   const selectedWatch = snapshot?.watchlist.find((item) => item.ticker === selectedTicker) ?? null;
-  const channelCounts = useMemo(() => Object.fromEntries(CHANNELS.map((entry) => [entry.id, items.filter((item) => itemMatchesChannel(item, entry.id, watchlistSet)).length])), [items, watchlistSet]);
   const streamLabel = liveConnected === true ? "Live" : liveConnected === false ? "Reconnecting" : "Connecting";
   const activeUniverse = snapshot?.scannerDiagnostics?.activeUniverseCount ?? snapshot?.activeUniverseTickers?.length ?? 0;
-  const haltCount = items.filter((item) => item.kind === "halt").length;
-  const newsCount = items.filter((item) => item.kind === "news" || item.kind === "filing").length;
   const nyClock = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(now));
 
+  function chooseChannel(next: Channel) {
+    setChannel(next);
+    setSidebarOpen(false);
+  }
+
+  function scrollToPresent() {
+    window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
+  }
+
   return (
-    <div className="terminal-shell">
-      {sidebarOpen ? <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} /> : null}
-      <aside className={`terminal-sidebar ${sidebarOpen ? "terminal-sidebar-open" : ""}`}>
-        <div className="brand-lockup">
-          <div className="brand-mark"><span /><span /><span /></div>
-          <div>
-            <p className="font-semibold tracking-tight text-white">PulseGrid</p>
-            <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Market intelligence</p>
-          </div>
-        </div>
+    <div className="nuntio-shell">
+      {sidebarOpen ? <button type="button" className="nuntio-mobile-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} /> : null}
 
-        <nav className="mt-8">
-          <p className="sidebar-label">Scanner</p>
-          <div className="mt-2 space-y-1">
-            {CHANNELS.map((entry) => (
-              <button
-                type="button"
-                key={entry.id}
-                onClick={() => { setChannel(entry.id); setSidebarOpen(false); }}
-                className={`channel-button ${channel === entry.id ? "channel-button-active" : ""}`}
-              >
-                <ChannelIcon value={entry.icon} />
-                <span className="flex-1 text-left">{entry.label}</span>
-                <span className="channel-count">{channelCounts[entry.id] ?? 0}</span>
-              </button>
-            ))}
-          </div>
-        </nav>
-
-        <div className="mt-8">
-          <p className="sidebar-label">Market status</p>
-          <div className="mt-3 rounded-xl border border-white/[0.06] bg-white/[0.025] p-3">
-            <div className="flex items-center gap-2">
-              <span className={`status-light ${liveConnected ? "status-light-live" : "status-light-warn"}`} />
-              <span className="text-sm font-medium text-slate-200">{streamLabel}</span>
-            </div>
-            <div className="mt-3 space-y-2 text-xs text-slate-500">
-              <div className="flex justify-between"><span>Session</span><span className="capitalize text-slate-300">{snapshot?.sessionStatus ?? "—"}</span></div>
-              <div className="flex justify-between"><span>New York</span><span className="font-mono text-slate-300">{nyClock}</span></div>
-              <div className="flex justify-between"><span>Universe</span><span className="text-slate-300">{activeUniverse}</span></div>
-            </div>
-          </div>
-        </div>
-
-        <p className="mt-auto pt-8 text-[10px] leading-4 text-slate-600">Scanner signals are informational and are not financial advice.</p>
+      <aside className={`nuntio-workspaces ${sidebarOpen ? "nuntio-workspaces-open" : ""}`} aria-label="Workspaces">
+        <div className="nuntio-workspace nuntio-workspace-home">PG</div>
+        <div className="nuntio-workspace-divider" />
+        <div className="nuntio-workspace nuntio-workspace-active"><span className="nuntio-mini-grid"><i /><i /><i /><i /></span></div>
+        <div className="nuntio-workspace">M</div>
+        <div className="nuntio-workspace">N</div>
+        <div className="nuntio-workspace nuntio-workspace-add">+</div>
       </aside>
 
-      <main className="terminal-main">
-        <header className="terminal-header">
-          <div className="flex items-center gap-3">
-            <button type="button" className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">☰</button>
-            <div>
-              <h1 className="text-lg font-semibold tracking-tight text-white">Live Scanner</h1>
-              <p className="text-xs text-slate-500">Real-time small-cap momentum wire</p>
-            </div>
+      <aside className={`nuntio-channels ${sidebarOpen ? "nuntio-channels-open" : ""}`}>
+        <div className="nuntio-server-header">
+          <div><span className="nuntio-server-logo">P</span><strong>PulseGrid</strong></div>
+          <span>⌄</span>
+        </div>
+        <button type="button" className="nuntio-browse"><span>☷</span> Browse Channels</button>
+
+        <div className="nuntio-channel-scroll">
+          <section className="nuntio-channel-section">
+            <p>Pinned Channels</p>
+            <button type="button" className="nuntio-channel-row" onClick={() => chooseChannel("catalysts")}><span>#</span><b>🚨 pr-spike</b></button>
+          </section>
+
+          <section className="nuntio-channel-section">
+            <p>Start <span>⌄</span></p>
+            <div className="nuntio-channel-row nuntio-channel-muted"><span>☑</span><b>start-here</b></div>
+          </section>
+
+          <section className="nuntio-channel-section">
+            <p>Scanner <span>⌄</span></p>
+            {CHANNELS.filter((entry) => entry.section === "scanner").map((entry) => (
+              <button key={entry.id} type="button" className={`nuntio-channel-row ${channel === entry.id ? "nuntio-channel-active" : ""}`} onClick={() => chooseChannel(entry.id)}>
+                <span>#</span><b>{entry.icon} {entry.label}</b><em>{counts[entry.id]}</em>
+              </button>
+            ))}
+          </section>
+
+          <section className="nuntio-channel-section">
+            <p>Tables <span>⌄</span></p>
+            {CHANNELS.filter((entry) => entry.section === "tables").map((entry) => (
+              <button key={entry.id} type="button" className={`nuntio-channel-row ${channel === entry.id ? "nuntio-channel-active" : ""}`} onClick={() => chooseChannel(entry.id)}>
+                <span>#</span><b>{entry.icon} {entry.label}</b><em>{counts[entry.id]}</em>
+              </button>
+            ))}
+          </section>
+        </div>
+
+        <div className="nuntio-sidebar-status">
+          <span className={`nuntio-status-dot ${liveConnected ? "nuntio-status-live" : ""}`} />
+          <div><strong>{streamLabel}</strong><small>{snapshot?.sessionLabel ?? "Loading market"}</small></div>
+          <span className="nuntio-sidebar-clock">{nyClock}</span>
+        </div>
+      </aside>
+
+      <main className="nuntio-main">
+        <header className="nuntio-topbar">
+          <div className="nuntio-channel-title">
+            <button type="button" className="nuntio-mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>☰</button>
+            <span>#</span><strong>{currentChannel.icon} {currentChannel.label}</strong>
           </div>
-          <div className="flex items-center gap-3">
-            <label className="terminal-search">
-              <span>⌕</span>
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search ticker or catalyst" aria-label="Search ticker or catalyst" />
-              {query ? <button type="button" onClick={() => setQuery("")} aria-label="Clear search">×</button> : null}
-            </label>
-            <div className={`live-chip ${liveConnected ? "live-chip-on" : ""}`}><span />{streamLabel}</div>
+          <div className="nuntio-toolbar">
+            <button type="button" aria-label="Notifications">◒</button>
+            <button type="button" aria-label="Pinned alerts">◆</button>
+            <label className="nuntio-search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search PulseGrid" aria-label="Search PulseGrid" /><span>⌕</span></label>
           </div>
         </header>
 
-        <div className="terminal-content">
-          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <MetricCard label="Top mover" value={topMover ? `${topMover.ticker} ${formatMove(topMover.changePercent)}` : "No signal"} detail={topMover ? `${formatPrice(topMover.tickerPrice)} · ${compactNumber(topMover.currentVolume)} vol` : "Waiting for qualifying setup"} tone="green" />
-            <MetricCard label="Active alerts" value={String(alerts.length)} detail={`${visibleItems.length} shown in current view`} tone="blue" />
-            <MetricCard label="Halts / catalysts" value={`${haltCount} / ${newsCount}`} detail="Current market session" tone="amber" />
-            <MetricCard label="Scanner universe" value={String(activeUniverse)} detail={snapshot?.scannerDiagnostics?.universeSource ?? "Live discovery"} tone="blue" />
-          </section>
-
-          <div className="mt-4 grid gap-4 2xl:grid-cols-[minmax(0,1fr)_310px]">
-            <section className="terminal-panel min-w-0">
-              <div className="terminal-panel-header">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="status-light status-light-live" />
-                    <h2 className="font-semibold text-white">Market wire</h2>
-                  </div>
-                  <p className="mt-1 text-xs text-slate-500">Newest alerts first · New York market time</p>
-                </div>
-                <span className="rounded-md border border-white/[0.08] px-2 py-1 font-mono text-[11px] text-slate-500">{visibleItems.length} events</span>
-              </div>
-
-              <div className="filter-strip">
-                <label><span>Move</span><select value={minMove} onChange={(event) => setMinMove(Number(event.target.value))}><option value={0}>Any</option><option value={5}>5%+</option><option value={10}>10%+</option><option value={20}>20%+</option><option value={50}>50%+</option></select></label>
-                <label><span>Price</span><select value={maxPrice} onChange={(event) => setMaxPrice(Number(event.target.value))}><option value={1}>Under $1</option><option value={2}>Under $2</option><option value={5}>Under $5</option><option value={10}>Under $10</option><option value={20}>Under $20</option><option value={100000}>All prices</option></select></label>
-                <div className="ml-auto hidden text-xs text-slate-600 sm:block">Click a ticker for details</div>
-              </div>
-
-              <div className="terminal-feed">
-                {loading ? (
-                  <div className="space-y-2 p-4">{Array.from({ length: 7 }).map((_, index) => <div key={index} className="feed-skeleton" />)}</div>
-                ) : visibleItems.length ? (
-                  visibleItems.map((item) => <FeedRow key={item.id} item={item} onSelect={setSelectedTicker} />)
-                ) : (
-                  <div className="empty-feed"><span>⌁</span><h3>No matching live alerts</h3><p>Adjust the channel or filters. The scanner will add new qualifying events automatically.</p></div>
-                )}
-              </div>
-            </section>
-
-            <aside className="space-y-4">
-              <section className="terminal-panel">
-                <div className="terminal-panel-header py-4"><div><h2 className="font-semibold text-white">Top movers</h2><p className="mt-1 text-xs text-slate-500">Ranked by session gain</p></div></div>
-                <div className="divide-y divide-white/[0.05]">
-                  {topMovers.length ? topMovers.map((alert, index) => (
-                    <button type="button" key={alert.id} onClick={() => setSelectedTicker(alert.ticker)} className="mover-row">
-                      <span className="mover-rank">{index + 1}</span>
-                      <span className="min-w-0 flex-1"><strong>{alert.ticker}</strong><small>{formatPrice(alert.tickerPrice)} · {compactNumber(alert.currentVolume)} vol</small></span>
-                      <span className={(alert.changePercent ?? 0) >= 0 ? "move-up" : "move-down"}>{formatMove(alert.changePercent)}</span>
-                    </button>
-                  )) : <p className="p-5 text-sm text-slate-500">No ranked movers yet.</p>}
-                </div>
-              </section>
-
-              <section className="terminal-panel p-4">
-                <div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-white">System health</h2><span className={`status-light ${liveConnected ? "status-light-live" : "status-light-warn"}`} /></div>
-                <div className="mt-4 space-y-3 text-xs">
-                  <div className="health-row"><span>WebSocket</span><strong>{snapshot?.scannerDiagnostics?.websocketConnected ? "Connected" : streamLabel}</strong></div>
-                  <div className="health-row"><span>Fresh quotes</span><strong>{snapshot?.scannerDiagnostics?.quoteFresh ?? 0}</strong></div>
-                  <div className="health-row"><span>Signals emitted</span><strong>{snapshot?.scannerDiagnostics?.alertsEmittedCount ?? alerts.length}</strong></div>
-                  <div className="health-row"><span>Persistence</span><strong>{snapshot?.persistence.durable ? "Durable" : snapshot?.persistence.mode ?? "—"}</strong></div>
-                </div>
-              </section>
-            </aside>
-          </div>
+        <div className="nuntio-feed-status">
+          <span className={`nuntio-status-dot ${liveConnected ? "nuntio-status-live" : ""}`} />
+          <strong>{streamLabel}</strong>
+          <span>{snapshot?.sessionLabel ?? "Loading"}</span>
+          <span>·</span>
+          <span>{activeUniverse} symbols</span>
+          <span>·</span>
+          <span>{alerts.length} active alerts</span>
+          <span className="nuntio-feed-status-right">New York market time</span>
         </div>
+
+        <section className="nuntio-feed" aria-live="polite">
+          {loading ? (
+            <div className="nuntio-loading"><span /><span /><span /><span /></div>
+          ) : groups.length ? (
+            groups.map((group) => <ChatMessageGroup key={group.id} group={group} onSelect={setSelectedTicker} />)
+          ) : (
+            <div className="nuntio-empty">
+              <div className="nuntio-empty-icon">#</div>
+              <h2>No alerts in #{currentChannel.label}</h2>
+              <p>The scanner is connected. New qualifying market events will appear here automatically.</p>
+            </div>
+          )}
+        </section>
+
+        <button type="button" className="nuntio-jump" onClick={scrollToPresent}><span>You’re viewing live messages</span><b>Jump To Present</b></button>
       </main>
 
       {selectedTicker ? (
-        <div className="ticker-drawer-wrap" role="dialog" aria-modal="true" aria-label={`${selectedTicker} details`}>
-          <button className="ticker-drawer-scrim" onClick={() => setSelectedTicker(null)} aria-label="Close ticker details" />
-          <aside className="ticker-drawer">
-            <div className="flex items-start justify-between gap-4 border-b border-white/[0.07] p-5">
-              <div><p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Ticker intelligence</p><h2 className="mt-1 text-3xl font-semibold tracking-tight text-white">{selectedTicker}</h2></div>
-              <button type="button" className="drawer-close" onClick={() => setSelectedTicker(null)}>×</button>
+        <div className="nuntio-drawer-wrap" role="dialog" aria-modal="true" aria-label={`${selectedTicker} details`}>
+          <button type="button" className="nuntio-drawer-scrim" aria-label="Close ticker details" onClick={() => setSelectedTicker(null)} />
+          <aside className="nuntio-drawer">
+            <div className="nuntio-drawer-header">
+              <div><span>Ticker intelligence</span><h2>{selectedTicker}</h2></div>
+              <button type="button" onClick={() => setSelectedTicker(null)}>×</button>
             </div>
-            <div className="space-y-5 overflow-y-auto p-5">
-              <div className="grid grid-cols-2 gap-2">
-                <div className="detail-stat"><span>Price</span><strong>{formatPrice(selectedAlert?.tickerPrice ?? selectedWatch?.price)}</strong></div>
-                <div className="detail-stat"><span>Move</span><strong className={(selectedAlert?.changePercent ?? selectedWatch?.changePercent ?? 0) >= 0 ? "move-up" : "move-down"}>{formatMove(selectedAlert?.changePercent ?? selectedWatch?.changePercent)}</strong></div>
-                <div className="detail-stat"><span>Volume</span><strong>{compactNumber(selectedAlert?.currentVolume)}</strong></div>
-                <div className="detail-stat"><span>RVOL</span><strong>{selectedAlert?.relativeVolume ? `${selectedAlert.relativeVolume.toFixed(1)}x` : "—"}</strong></div>
-                <div className="detail-stat"><span>Float</span><strong>{compactNumber(selectedAlert?.floatShares)}</strong></div>
-                <div className="detail-stat"><span>Score</span><strong>{selectedAlert?.score ?? "—"}</strong></div>
+            <div className="nuntio-drawer-body">
+              <div className="nuntio-detail-grid">
+                <div><span>Price</span><strong>{formatPrice(selectedAlert?.tickerPrice ?? selectedWatch?.price)}</strong></div>
+                <div><span>Move</span><strong className={(selectedAlert?.changePercent ?? selectedWatch?.changePercent ?? 0) >= 0 ? "nuntio-positive" : "nuntio-negative"}>{formatMove(selectedAlert?.changePercent ?? selectedWatch?.changePercent)}</strong></div>
+                <div><span>Volume</span><strong>{compactNumber(selectedAlert?.currentVolume)}</strong></div>
+                <div><span>RVOL</span><strong>{selectedAlert?.relativeVolume ? `${selectedAlert.relativeVolume.toFixed(1)}x` : "—"}</strong></div>
+                <div><span>Float</span><strong>{compactNumber(selectedAlert?.floatShares)}</strong></div>
+                <div><span>Score</span><strong>{selectedAlert?.score ?? "—"}</strong></div>
               </div>
-              <div className="drawer-section"><span>Latest trigger</span><strong>{selectedAlert?.alertType.replaceAll("_", " ") ?? selectedWatch?.activeSignalType ?? "Watchlist"}</strong><p>{selectedAlert?.reason ?? "Live quote context is available from the watchlist."}</p></div>
-              {selectedAlert?.newsHeadline ? <div className="drawer-section"><span>Catalyst</span><strong>Latest news</strong><p>{selectedAlert.newsHeadline}</p>{selectedAlert.newsUrl ? <a href={selectedAlert.newsUrl} target="_blank" rel="noreferrer">Open source ↗</a> : null}</div> : null}
-              <div className="drawer-section"><span>Market data</span><div className="mt-3 flex flex-wrap gap-2">{[countryFlag(selectedAlert?.countryCode ?? null), selectedAlert?.highCostToBorrow ? "High CTB" : null, selectedAlert?.shortInterestPercent ? `SI ${selectedAlert.shortInterestPercent.toFixed(1)}%` : null, selectedAlert?.marketCap ? `MC ${compactNumber(selectedAlert.marketCap)}` : null].filter(Boolean).map((tag) => <em key={tag}>{tag}</em>)}</div></div>
-              <p className="text-[11px] leading-5 text-slate-600">Market data may be delayed or unavailable during provider interruptions. Verify important information before acting.</p>
+              <section className="nuntio-detail-section"><span>Latest trigger</span><strong>{selectedAlert ? normalizeLabel(selectedAlert.alertType) : selectedWatch?.activeSignalType ?? "Watchlist"}</strong><p>{selectedAlert?.reason ?? "Waiting for a fresh qualifying event."}</p></section>
+              {selectedAlert?.newsHeadline ? <section className="nuntio-detail-section"><span>Catalyst</span><strong>{selectedAlert.newsHeadline}</strong>{selectedAlert.newsUrl ? <a href={selectedAlert.newsUrl} target="_blank" rel="noreferrer">Open source ↗</a> : null}</section> : null}
+              <p className="nuntio-disclaimer">Scanner data is informational and may be delayed. Verify important information before acting.</p>
             </div>
           </aside>
         </div>
