@@ -2,6 +2,8 @@
 
 PulseGrid Lite is a compact real-time inspired dashboard for momentum stock signals. It is focused on a polished live V1: watchlist quote polling, deterministic live signal cards, filter controls, a watchlist, detail drawer, and in-app trigger toasts without backend sprawl.
 
+**Production:** [pulsegrid-lite.vercel.app](https://pulsegrid-lite.vercel.app/)
+
 ## Stack
 
 - Next.js App Router
