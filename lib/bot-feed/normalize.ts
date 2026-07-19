@@ -132,6 +132,7 @@ export function buildBotFeed(params: BuildBotFeedParams): {
   const signalByTicker = new Map(params.signals.map((signal) => [signal.ticker, signal]));
   const nextItems = [...previous.items];
   const nextDedupe = { ...previous.lastEmittedAtByKey };
+  let pendingSourceHeader: SourceHeaderItem | null = null;
   let ordinal = 0;
 
   function makeId(type: BotFeedItem["type"], timestamp: string) {
@@ -150,7 +151,14 @@ export function buildBotFeed(params: BuildBotFeedParams): {
 
   function emit(item: BotFeedItem, windowMs = 0) {
     if (windowMs > 0 && !shouldEmit(item.dedupeKey, item.timestamp, windowMs)) {
+      pendingSourceHeader = null;
       return false;
+    }
+
+    if (item.type !== "source_header" && pendingSourceHeader) {
+      nextItems.push(pendingSourceHeader);
+      nextDedupe[pendingSourceHeader.dedupeKey] = pendingSourceHeader.timestamp;
+      pendingSourceHeader = null;
     }
 
     nextItems.push(item);
@@ -159,20 +167,18 @@ export function buildBotFeed(params: BuildBotFeedParams): {
   }
 
   function maybeInsertSourceHeader(source: string, timestamp: string, familyKey: string, subLabel?: string) {
-    const lastItem = nextItems[nextItems.length - 1];
     const lastHeader = [...nextItems].reverse().find((item) => item.type === "source_header") as SourceHeaderItem | undefined;
     const lastHeaderAtMs = lastHeader ? new Date(lastHeader.timestamp).getTime() : 0;
-    const lastHeaderSource = lastHeader?.source ?? "";
-    const lastFamily = lastItem ? `${lastItem.source}|${lastItem.type}` : "";
-    const nextFamily = `${source}|${familyKey}`;
+    const headerFamilyPrefix = `source|${source}|${familyKey}|`;
+    const lastHeaderMatchesFamily = Boolean(lastHeader?.dedupeKey.startsWith(headerFamilyPrefix));
+    const eventAtMs = new Date(timestamp).getTime();
 
     if (
-      !lastItem ||
-      lastHeaderSource !== source ||
-      lastFamily !== nextFamily ||
-      observedAtMs - lastHeaderAtMs >= SOURCE_HEADER_GAP_MS
+      !lastHeader ||
+      !lastHeaderMatchesFamily ||
+      eventAtMs - lastHeaderAtMs >= SOURCE_HEADER_GAP_MS
     ) {
-      emit({
+      pendingSourceHeader = {
         id: makeId("source_header", timestamp),
         type: "source_header",
         source,
@@ -182,8 +188,11 @@ export function buildBotFeed(params: BuildBotFeedParams): {
         marketDayKey,
         priority: "low",
         dedupeKey: `source|${source}|${familyKey}|${formatHeaderTime(timestamp)}`,
-      } satisfies SourceHeaderItem);
+      } satisfies SourceHeaderItem;
+      return;
     }
+
+    pendingSourceHeader = null;
   }
 
   const sessionCopy = sessionMarkerCopy(params.sessionStatus);
